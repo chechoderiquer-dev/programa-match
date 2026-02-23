@@ -4,7 +4,7 @@ import sqlite3
 from datetime import date
 
 # Nueva DB para evitar conflicto con la versión anterior
-DB_PATH = "match_v2.db"
+DB_PATH = "match_v3.db"
 
 # Columnas obligatorias (incluye nuevas)
 REQUIRED_COLS = [
