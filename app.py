@@ -3,8 +3,8 @@ import pandas as pd
 import sqlite3
 import re
 
-# ✅ NEW DB => clean start
-DB_PATH = "match_v8.db"
+# ✅ New DB name to start clean after schema/logic changes
+DB_PATH = "match_v9.db"
 
 VALID_GENERO = {"mujer", "hombre", "otro"}
 VALID_PREF_GENERO = {"mixto", "solo_mujeres", "solo_hombres"}
@@ -69,51 +69,89 @@ def upsert_clients(df: pd.DataFrame):
 
     cols = [
         "nombre", "telefono", "pais", "edad", "genero", "pref_genero", "idioma",
-        "zona", "budget", "inicio", "fin", "max_compartir_con", "banos_min", "notas"
+        "zona", "budget", "inicio", "fin",
+        "max_compartir_con", "banos_min", "notas"
     ]
     df2[cols].to_sql("clientes", conn, if_exists="append", index=False)
     conn.close()
 
 
-# ---------------- Normalization ----------------
+# ---------------- Normalization (Definitive Excel-proof) ----------------
 def normalize_phone(telefono: str) -> str:
+    """
+    Normaliza teléfonos aunque Excel:
+    - Quite el '+'
+    - Los convierta a número
+    - Use notación científica (3.46E+11)
+    """
     if telefono is None:
         return ""
+
     t = str(telefono).strip()
-    return re.sub(r"[^\d\+]", "", t)  # keep + and digits
+
+    # Si viene en notación científica (ej 3.46E+11)
+    if "E+" in t.upper():
+        try:
+            t = str(int(float(t)))
+        except Exception:
+            pass
+
+    # Quitar todo lo que no sea número
+    t = re.sub(r"[^\d]", "", t)
+
+    if not t:
+        return ""
+
+    # Si ya empieza por código país conocido
+    country_codes = [
+        "351", "353",  # Portugal, Ireland (3 digits)
+        "34", "52", "57", "54", "33", "39", "44", "49", "31", "41",
+        "1"  # USA/Canada
+    ]
+
+    for cc in country_codes:
+        if t.startswith(cc) and len(t) >= len(cc) + 7:
+            return "+" + t
+
+    # Si son 9 dígitos → asumimos España
+    if len(t) == 9:
+        return "+34" + t
+
+    # Si es largo (>9) pero sin prefijo claro
+    if len(t) > 9:
+        return "+" + t
+
+    return ""
 
 
 def detectar_pais(telefono: str) -> str:
     if not telefono:
         return "Unknown"
-    t = str(telefono).strip()
-    t = re.sub(r"[^\d\+]", "", t)
-
-    if t.startswith("+34"):
+    if telefono.startswith("+34"):
         return "Spain"
-    if t.startswith("+52"):
+    if telefono.startswith("+52"):
         return "Mexico"
-    if t.startswith("+57"):
+    if telefono.startswith("+57"):
         return "Colombia"
-    if t.startswith("+1"):
+    if telefono.startswith("+1"):
         return "USA/Canada"
-    if t.startswith("+54"):
+    if telefono.startswith("+54"):
         return "Argentina"
-    if t.startswith("+33"):
+    if telefono.startswith("+33"):
         return "France"
-    if t.startswith("+39"):
+    if telefono.startswith("+39"):
         return "Italy"
-    if t.startswith("+44"):
+    if telefono.startswith("+44"):
         return "UK"
-    if t.startswith("+49"):
+    if telefono.startswith("+49"):
         return "Germany"
-    if t.startswith("+31"):
+    if telefono.startswith("+31"):
         return "Netherlands"
-    if t.startswith("+41"):
+    if telefono.startswith("+41"):
         return "Switzerland"
-    if t.startswith("+351"):
+    if telefono.startswith("+351"):
         return "Portugal"
-    if t.startswith("+353"):
+    if telefono.startswith("+353"):
         return "Ireland"
     return "Other"
 
@@ -130,9 +168,12 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         df["notas"] = ""
 
     df["nombre"] = df["nombre"].astype(str).str.strip()
+
+    # Phones + country
     df["telefono"] = df["telefono"].apply(normalize_phone)
     df["pais"] = df["telefono"].apply(detectar_pais)
 
+    # Basic fields
     df["edad"] = pd.to_numeric(df["edad"], errors="coerce")
     df["genero"] = df["genero"].astype(str).str.strip().str.lower()
     df["pref_genero"] = df["pref_genero"].astype(str).str.strip().str.lower()
@@ -158,14 +199,15 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         "max_compartir_con", "banos_min"
     ])
 
+    # ✅ Definitive: validate by minimum length (NOT by "+")
+    df = df[df["telefono"].str.len() >= 10]
     df = df[df["fin"] >= df["inicio"]]
-    df = df[df["telefono"].str.startswith("+")]
 
     df["edad"] = df["edad"].astype(int)
     df["max_compartir_con"] = df["max_compartir_con"].astype(int)
     df["banos_min"] = df["banos_min"].astype(int)
 
-    # Basic sanity
+    # Sanity constraints
     df = df[(df["edad"] >= 18) & (df["edad"] <= 80)]
     df = df[(df["banos_min"] >= 1) & (df["max_compartir_con"] >= 0)]
 
@@ -235,7 +277,6 @@ def age_score(e1, e2) -> float:
 def genero_compatible(pref_target: str, genero_other: str) -> bool:
     pref_target = (pref_target or "mixto").lower()
     genero_other = (genero_other or "otro").lower()
-
     if pref_target == "mixto":
         return True
     if pref_target == "solo_mujeres":
@@ -266,15 +307,7 @@ def compute_matches(
         return pd.DataFrame()
 
     if weights is None:
-        # Must sum ~1.0 (we do not strictly require; just keep consistent)
-        weights = {
-            "zone": 0.25,
-            "budget": 0.15,
-            "dates": 0.20,
-            "share": 0.10,
-            "bath": 0.10,
-            "age": 0.20,
-        }
+        weights = {"zone": 0.25, "budget": 0.15, "dates": 0.20, "share": 0.10, "bath": 0.10, "age": 0.20}
 
     target = df[df["id"] == target_id].iloc[0]
     tz = zones_set(target["zona"])
@@ -312,7 +345,6 @@ def compute_matches(
         baths = bath_score(target["banos_min"], other["banos_min"])
         ages = age_score(target["edad"], other["edad"])
 
-        # Total score (0..1-ish)
         score_total = (
             weights["zone"] * zs +
             weights["budget"] * bs +
@@ -339,7 +371,6 @@ def compute_matches(
             "match_min_bath": int(other.get("banos_min", 1)),
             "overlap_days": int(odays),
 
-            # breakdown scores
             "score_zone": round(zs, 2),
             "score_budget": round(bs, 2),
             "score_dates": round(ds, 2),
@@ -360,7 +391,6 @@ def compute_matches(
 
 # ---------------- WhatsApp message generator ----------------
 def generate_whatsapp_intro(target: pd.Series, match_row: pd.Series) -> str:
-    # English template (you can customize brand/name)
     return (
         f"Hi {match_row['match_name']}! 👋\n\n"
         f"I'm connecting you with someone who could be a great roommate match.\n\n"
@@ -396,7 +426,6 @@ with st.sidebar:
     )
     st.caption("genero: mujer | hombre | otro")
     st.caption("pref_genero: mixto | solo_mujeres | solo_hombres")
-    st.caption("telefono must start with + (country code)")
 
     if st.button("Import to database", type="primary"):
         if file is None:
@@ -421,7 +450,6 @@ st.subheader("💞 Matchmaking")
 if df.empty:
     st.info("Upload clients to start matching.")
 else:
-    # Target selector
     colA, colB, colC, colD = st.columns([2, 1, 1, 1])
 
     with colA:
@@ -440,7 +468,6 @@ else:
     with colD:
         require_zone = st.checkbox("Require same zone", value=True)
 
-    # Filters
     countries = ["All"] + sorted([c for c in df["pais"].dropna().unique().tolist() if str(c).strip() != ""])
     languages = ["All"] + sorted([l for l in df["idioma"].dropna().unique().tolist() if str(l).strip() != ""])
 
@@ -450,7 +477,6 @@ else:
     with col2:
         language_filter = st.selectbox("Filter by language", options=languages)
 
-    # Visible scoring weights (advanced)
     st.markdown("### Scoring weights (advanced)")
     wcol1, wcol2, wcol3, wcol4, wcol5, wcol6 = st.columns(6)
     with wcol1:
@@ -466,7 +492,6 @@ else:
     with wcol6:
         w_age = st.slider("Age", 0.0, 0.6, 0.20, 0.05)
 
-    # Normalize weights to sum to 1 (so score_total stays comparable)
     total_w = w_zone + w_budget + w_dates + w_share + w_bath + w_age
     if total_w == 0:
         st.warning("Set at least one weight > 0.")
@@ -481,7 +506,6 @@ else:
             "age": w_age / total_w,
         }
 
-    # Compute matches
     matches = compute_matches(
         df=df,
         target_id=int(target_id),
@@ -499,13 +523,11 @@ else:
         st.markdown("### ✅ Matches (with advanced scoring breakdown)")
         st.dataframe(matches, use_container_width=True)
 
-        # Download
         csv = matches.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download matches (CSV)", data=csv, file_name="matches_advanced.csv", mime="text/csv")
 
         st.divider()
 
-        # WhatsApp message generator
         st.markdown("### 📲 Generate WhatsApp introduction message")
         match_choice = st.selectbox(
             "Select one match to generate a WhatsApp message",
