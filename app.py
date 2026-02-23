@@ -5,8 +5,7 @@ import re
 import itertools
 from urllib.parse import quote
 
-# ✅ NEW DB (clean start)
-DB_PATH = "match_v10.db"
+DB_PATH = "match_v11.db"
 
 VALID_GENERO = {"mujer", "hombre", "otro"}
 VALID_PREF_GENERO = {"mixto", "solo_mujeres", "solo_hombres"}
@@ -30,7 +29,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS clientes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL,
-            telefono TEXT NOT NULL,
+            telefono TEXT NOT NULL UNIQUE,
             pais TEXT,
             edad INTEGER NOT NULL,
             genero TEXT NOT NULL,
@@ -52,6 +51,15 @@ def init_db():
     conn.close()
 
 
+def reset_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS clientes")
+    conn.commit()
+    conn.close()
+    init_db()
+
+
 def load_clients() -> pd.DataFrame:
     conn = get_conn()
     df = pd.read_sql_query("SELECT * FROM clientes", conn)
@@ -63,61 +71,96 @@ def load_clients() -> pd.DataFrame:
     return df
 
 
-def upsert_clients(df: pd.DataFrame):
+def upsert_clients(df: pd.DataFrame) -> tuple[int, int]:
+    """
+    Inserta o actualiza por 'telefono' (UNIQUE).
+    Retorna (inserted_or_updated, total_rows_processed)
+    """
     conn = get_conn()
+    cur = conn.cursor()
+
     df2 = df.copy()
     df2["inicio"] = df2["inicio"].astype(str)
     df2["fin"] = df2["fin"].astype(str)
 
-    cols = [
-        "nombre", "telefono", "pais", "edad", "genero", "pref_genero", "idioma",
-        "zona", "budget", "inicio", "fin",
-        "max_compartir_con", "banos_min", "notas"
-    ]
-    df2[cols].to_sql("clientes", conn, if_exists="append", index=False)
+    rows = df2.to_dict(orient="records")
+    processed = 0
+    for r in rows:
+        processed += 1
+        cur.execute("""
+            INSERT INTO clientes (
+                nombre, telefono, pais, edad, genero, pref_genero, idioma,
+                zona, budget, inicio, fin,
+                max_compartir_con, banos_min, notas
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telefono) DO UPDATE SET
+                nombre=excluded.nombre,
+                pais=excluded.pais,
+                edad=excluded.edad,
+                genero=excluded.genero,
+                pref_genero=excluded.pref_genero,
+                idioma=excluded.idioma,
+                zona=excluded.zona,
+                budget=excluded.budget,
+                inicio=excluded.inicio,
+                fin=excluded.fin,
+                max_compartir_con=excluded.max_compartir_con,
+                banos_min=excluded.banos_min,
+                notas=excluded.notas
+        """, (
+            r.get("nombre", ""),
+            r.get("telefono", ""),
+            r.get("pais", ""),
+            int(r.get("edad", 0)),
+            r.get("genero", "otro"),
+            r.get("pref_genero", "mixto"),
+            r.get("idioma", ""),
+            r.get("zona", ""),
+            float(r.get("budget", 0)),
+            r.get("inicio", ""),
+            r.get("fin", ""),
+            int(r.get("max_compartir_con", 0)),
+            int(r.get("banos_min", 1)),
+            r.get("notas", "")
+        ))
+
+    conn.commit()
+
+    # SQLite no da fácil cuántos fueron inserts vs updates con ON CONFLICT.
+    # Pero te devolvemos "processed".
     conn.close()
+    return processed, processed
 
 
 # ---------------- Normalization (Excel-proof phones) ----------------
 def normalize_phone(telefono: str) -> str:
-    """
-    Normaliza teléfonos aunque Excel:
-    - Quite el '+'
-    - Los convierta a número
-    - Use notación científica (3.46E+11)
-    """
     if telefono is None:
         return ""
-
     t = str(telefono).strip()
 
-    # notación científica
     if "E+" in t.upper():
         try:
             t = str(int(float(t)))
         except Exception:
             pass
 
-    # deja sólo dígitos
     t = re.sub(r"[^\d]", "", t)
     if not t:
         return ""
 
-    # códigos país comunes (incluye 3 dígitos)
     country_codes = [
-        "351", "353",  # Portugal, Ireland
+        "351", "353",
         "34", "52", "57", "54", "33", "39", "44", "49", "31", "41",
-        "1"  # USA/Canada
+        "1"
     ]
     for cc in country_codes:
         if t.startswith(cc) and len(t) >= len(cc) + 7:
             return "+" + t
 
-    # 9 dígitos => asumimos España
     if len(t) == 9:
         return "+34" + t
 
-    # largo => lo aceptamos
     if len(t) > 9:
         return "+" + t
 
@@ -168,7 +211,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         df["notas"] = ""
 
     df["nombre"] = df["nombre"].astype(str).str.strip()
-
     df["telefono"] = df["telefono"].apply(normalize_phone)
     df["pais"] = df["telefono"].apply(detectar_pais)
 
@@ -196,7 +238,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         "max_compartir_con", "banos_min"
     ])
 
-    # ✅ validate by length (avoid Excel '+' issues)
     df = df[df["telefono"].str.len() >= 10]
     df = df[df["fin"] >= df["inicio"]]
 
@@ -471,7 +512,6 @@ def generate_groups(
         if not ok:
             continue
 
-        # Respect max_compartir_con for all members
         roommates_needed = group_size - 1
         if any(int(m["max_compartir_con"]) < roommates_needed for m in members):
             continue
@@ -516,7 +556,6 @@ def dashboard(df: pd.DataFrame):
     with c4:
         st.metric("Avg age", round(df["edad"].mean(), 1) if "edad" in df.columns and len(df) else "—")
 
-    # Top zones
     if "zona" in df.columns and len(df):
         z = df["zona"].astype(str).str.replace(",", "|")
         z = z.str.split("|").explode().str.strip()
@@ -533,12 +572,12 @@ def dashboard(df: pd.DataFrame):
         st.markdown("**Clients by language**")
         st.bar_chart(df["idioma"].value_counts())
 
-    # ✅ FIX: convert Interval index to string so Altair doesn't crash
+    # ✅ FIX Interval -> string
     if "edad" in df.columns and len(df):
         st.markdown("**Age distribution**")
         age_bins = pd.cut(df["edad"], bins=[17, 20, 25, 30, 35, 40, 50, 80], right=True)
         counts = age_bins.value_counts().sort_index()
-        counts.index = counts.index.astype(str)  # <- critical fix
+        counts.index = counts.index.astype(str)
         st.bar_chart(counts)
 
 
@@ -553,13 +592,9 @@ with st.sidebar:
     file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
     sheet_name = st.text_input("Sheet name", value="clientes")
 
-    st.caption("Required columns:")
-    st.code(
-        "nombre, telefono, edad, genero, pref_genero, idioma, zona, budget, inicio, fin, max_compartir_con, banos_min (notas optional)",
-        language="text"
-    )
-    st.caption("genero: mujer | hombre | otro")
-    st.caption("pref_genero: mixto | solo_mujeres | solo_hombres")
+    if st.button("Reset database (delete all)", type="secondary"):
+        reset_db()
+        st.success("Database reset. Upload again.")
 
     if st.button("Import to database", type="primary"):
         if file is None:
@@ -568,8 +603,8 @@ with st.sidebar:
             try:
                 df_excel = pd.read_excel(file, sheet_name=sheet_name)
                 df_clean = normalize_df(df_excel)
-                upsert_clients(df_clean)
-                st.success(f"Imported {len(df_clean)} clients.")
+                processed, _ = upsert_clients(df_clean)
+                st.success(f"Upserted {processed} clients (no duplicates by phone).")
             except Exception as e:
                 st.error(f"Import error: {e}")
 
@@ -677,37 +712,6 @@ with tab2:
             st.markdown("### 📲 WhatsApp Web links (click to open)")
             st.dataframe(wa_df, use_container_width=True)
 
-            st.download_button(
-                "⬇️ Download matches (CSV)",
-                data=matches.to_csv(index=False).encode("utf-8"),
-                file_name="matches_advanced.csv",
-                mime="text/csv"
-            )
-
-            st.download_button(
-                "⬇️ Download WhatsApp links (CSV)",
-                data=wa_df.to_csv(index=False).encode("utf-8"),
-                file_name="whatsapp_links.csv",
-                mime="text/csv"
-            )
-
-            st.divider()
-
-            st.markdown("### ✍️ Generate WhatsApp introduction message")
-            match_choice = st.selectbox(
-                "Pick one match",
-                options=matches["match_id"].tolist(),
-                format_func=lambda mid: f"{int(mid)} — {matches[matches['match_id']==mid].iloc[0]['match_name']} ({matches[matches['match_id']==mid].iloc[0]['match_country']})"
-            )
-
-            match_row = matches[matches["match_id"] == int(match_choice)].iloc[0]
-            msg = generate_whatsapp_intro(target, match_row)
-            st.text_area("Message (copy & paste)", value=msg, height=260)
-
-            link = whatsapp_web_link(match_row.get("match_phone", ""), msg)
-            if link:
-                st.link_button("Open WhatsApp Web with message", link)
-
 with tab3:
     st.subheader("👥 Group Matching (3–4 people)")
     if df.empty:
@@ -731,94 +735,28 @@ with tab3:
         min_overlap_days_g = st.number_input("Min overlap (days)", min_value=1, max_value=365, value=30, key="min_overlap_group")
         require_zone_g = st.checkbox("Require same zone", value=True, key="req_zone_group")
 
-        countries = ["All"] + sorted([c for c in df["pais"].dropna().unique().tolist() if str(c).strip() != ""])
-        languages = ["All"] + sorted([l for l in df["idioma"].dropna().unique().tolist() if str(l).strip() != ""])
-
-        f1, f2 = st.columns([1, 1])
-        with f1:
-            country_filter_g = st.selectbox("Filter by country", options=countries, key="country_group")
-        with f2:
-            language_filter_g = st.selectbox("Filter by language", options=languages, key="lang_group")
-
-        # weights reused from simple sliders to keep UI lighter
-        wg_zone = st.slider("Group weight: Zone", 0.0, 0.6, 0.25, 0.05, key="gwz")
-        wg_budget = st.slider("Group weight: Budget", 0.0, 0.6, 0.15, 0.05, key="gwb")
-        wg_dates = st.slider("Group weight: Dates", 0.0, 0.6, 0.20, 0.05, key="gwd")
-        wg_share = st.slider("Group weight: Sharing", 0.0, 0.6, 0.10, 0.05, key="gws")
-        wg_bath = st.slider("Group weight: Bathrooms", 0.0, 0.6, 0.10, 0.05, key="gwba")
-        wg_age = st.slider("Group weight: Age", 0.0, 0.6, 0.20, 0.05, key="gwa")
-
-        total_wg = wg_zone + wg_budget + wg_dates + wg_share + wg_bath + wg_age
-        if total_wg == 0:
-            st.warning("Set at least one group weight > 0.")
-            weights_g = {"zone": 0, "budget": 0, "dates": 0, "share": 0, "bath": 0, "age": 0}
-        else:
-            weights_g = {
-                "zone": wg_zone / total_wg,
-                "budget": wg_budget / total_wg,
-                "dates": wg_dates / total_wg,
-                "share": wg_share / total_wg,
-                "bath": wg_bath / total_wg,
-                "age": wg_age / total_wg,
-            }
-
         pool_matches = compute_matches(
             df=df,
             target_id=int(target_id_g),
             top_n=int(pool_top),
             min_overlap_days=int(min_overlap_days_g),
             require_zone=bool(require_zone_g),
-            country_filter=country_filter_g,
-            language_filter=language_filter_g,
-            weights=weights_g
+            weights={"zone": 0.25, "budget": 0.15, "dates": 0.20, "share": 0.10, "bath": 0.10, "age": 0.20}
         )
 
-        if pool_matches.empty:
-            st.info("No candidates for group formation with current filters.")
+        groups = generate_groups(
+            df=df,
+            target_id=int(target_id_g),
+            matches_df=pool_matches,
+            group_size=int(group_size),
+            max_groups=int(max_groups),
+            weights={"zone": 0.25, "budget": 0.15, "dates": 0.20, "share": 0.10, "bath": 0.10, "age": 0.20},
+            min_overlap_days=int(min_overlap_days_g),
+            require_zone=bool(require_zone_g)
+        )
+
+        if groups.empty:
+            st.info("No compatible groups found from the current pool.")
         else:
-            groups = generate_groups(
-                df=df,
-                target_id=int(target_id_g),
-                matches_df=pool_matches,
-                group_size=int(group_size),
-                max_groups=int(max_groups),
-                weights=weights_g,
-                min_overlap_days=int(min_overlap_days_g),
-                require_zone=bool(require_zone_g)
-            )
-
-            if groups.empty:
-                st.info("No compatible groups found from the current pool.")
-            else:
-                st.markdown("### ✅ Best groups")
-                st.dataframe(groups, use_container_width=True)
-
-                st.download_button(
-                    "⬇️ Download groups (CSV)",
-                    data=groups.to_csv(index=False).encode("utf-8"),
-                    file_name="groups.csv",
-                    mime="text/csv"
-                )
-
-                st.divider()
-                st.markdown("### 📲 Group intro message")
-                group_pick = st.selectbox(
-                    "Pick a group",
-                    options=list(range(len(groups))),
-                    format_func=lambda i: f"Score {groups.iloc[i]['group_score']} — {groups.iloc[i]['members'][:60]}...",
-                    key="group_pick"
-                )
-                grp = groups.iloc[int(group_pick)]
-                member_ids = [int(x) for x in str(grp["member_ids"]).split(",") if str(x).strip().isdigit()]
-                members = df[df["id"].isin(member_ids)].copy()
-
-                names_list = ", ".join(members["nombre"].tolist())
-                phones_list = " | ".join(members["telefono"].tolist())
-                msg = (
-                    "Hi everyone! 👋\n\n"
-                    "I'm introducing you because you look like a strong roommate group match.\n\n"
-                    f"Group members: {names_list}\n"
-                    f"Phones: {phones_list}\n\n"
-                    "If you're all happy, feel free to create a group chat and set up a quick call 😊"
-                )
-                st.text_area("Group message (copy & paste)", value=msg, height=220)
+            st.markdown("### ✅ Best groups")
+            st.dataframe(groups, use_container_width=True)
