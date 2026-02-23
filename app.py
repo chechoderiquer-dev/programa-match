@@ -2,9 +2,11 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import re
+import itertools
+from urllib.parse import quote
 
-# ✅ New DB name to start clean after schema/logic changes
-DB_PATH = "match_v9.db"
+# ✅ NEW DB (clean start)
+DB_PATH = "match_v10.db"
 
 VALID_GENERO = {"mujer", "hombre", "otro"}
 VALID_PREF_GENERO = {"mixto", "solo_mujeres", "solo_hombres"}
@@ -76,7 +78,7 @@ def upsert_clients(df: pd.DataFrame):
     conn.close()
 
 
-# ---------------- Normalization (Definitive Excel-proof) ----------------
+# ---------------- Normalization (Excel-proof phones) ----------------
 def normalize_phone(telefono: str) -> str:
     """
     Normaliza teléfonos aunque Excel:
@@ -89,35 +91,33 @@ def normalize_phone(telefono: str) -> str:
 
     t = str(telefono).strip()
 
-    # Si viene en notación científica (ej 3.46E+11)
+    # notación científica
     if "E+" in t.upper():
         try:
             t = str(int(float(t)))
         except Exception:
             pass
 
-    # Quitar todo lo que no sea número
+    # deja sólo dígitos
     t = re.sub(r"[^\d]", "", t)
-
     if not t:
         return ""
 
-    # Si ya empieza por código país conocido
+    # códigos país comunes (incluye 3 dígitos)
     country_codes = [
-        "351", "353",  # Portugal, Ireland (3 digits)
+        "351", "353",  # Portugal, Ireland
         "34", "52", "57", "54", "33", "39", "44", "49", "31", "41",
         "1"  # USA/Canada
     ]
-
     for cc in country_codes:
         if t.startswith(cc) and len(t) >= len(cc) + 7:
             return "+" + t
 
-    # Si son 9 dígitos → asumimos España
+    # 9 dígitos => asumimos España
     if len(t) == 9:
         return "+34" + t
 
-    # Si es largo (>9) pero sin prefijo claro
+    # largo => lo aceptamos
     if len(t) > 9:
         return "+" + t
 
@@ -169,11 +169,9 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df["nombre"] = df["nombre"].astype(str).str.strip()
 
-    # Phones + country
     df["telefono"] = df["telefono"].apply(normalize_phone)
     df["pais"] = df["telefono"].apply(detectar_pais)
 
-    # Basic fields
     df["edad"] = pd.to_numeric(df["edad"], errors="coerce")
     df["genero"] = df["genero"].astype(str).str.strip().str.lower()
     df["pref_genero"] = df["pref_genero"].astype(str).str.strip().str.lower()
@@ -192,14 +190,13 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df["notas"] = df["notas"].astype(str).fillna("").str.strip()
 
-    # Drop invalid rows
     df = df.dropna(subset=[
         "nombre", "telefono", "edad", "idioma",
         "zona", "budget", "inicio", "fin",
         "max_compartir_con", "banos_min"
     ])
 
-    # ✅ Definitive: validate by minimum length (NOT by "+")
+    # ✅ validate by length (avoid Excel '+' issues)
     df = df[df["telefono"].str.len() >= 10]
     df = df[df["fin"] >= df["inicio"]]
 
@@ -207,7 +204,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df["max_compartir_con"] = df["max_compartir_con"].astype(int)
     df["banos_min"] = df["banos_min"].astype(int)
 
-    # Sanity constraints
     df = df[(df["edad"] >= 18) & (df["edad"] <= 80)]
     df = df[(df["banos_min"] >= 1) & (df["max_compartir_con"] >= 0)]
 
@@ -293,6 +289,44 @@ def match_genero_bidireccional(t: pd.Series, o: pd.Series) -> bool:
     )
 
 
+def score_pair(target: pd.Series, other: pd.Series, min_overlap_days: int, require_zone: bool, weights: dict):
+    # Gender hard filter
+    if not match_genero_bidireccional(target, other):
+        return None
+
+    tz = zones_set(target["zona"])
+    oz = zones_set(other["zona"])
+    zs = zone_score(tz, oz)
+    if require_zone and zs == 0:
+        return None
+
+    odays = overlap_days(target["inicio"], target["fin"], other["inicio"], other["fin"])
+    ds = date_score(odays, min_days=min_overlap_days)
+    bs = budget_score(float(target["budget"]), float(other["budget"]))
+    ss = share_score(target["max_compartir_con"], other["max_compartir_con"])
+    baths = bath_score(target["banos_min"], other["banos_min"])
+    ages = age_score(target["edad"], other["edad"])
+
+    total = (
+        weights["zone"] * zs +
+        weights["budget"] * bs +
+        weights["dates"] * ds +
+        weights["share"] * ss +
+        weights["bath"] * baths +
+        weights["age"] * ages
+    )
+    return {
+        "score_total": float(total),
+        "score_zone": float(zs),
+        "score_budget": float(bs),
+        "score_dates": float(ds),
+        "score_share": float(ss),
+        "score_bath": float(baths),
+        "score_age": float(ages),
+        "overlap_days": int(odays),
+    }
+
+
 def compute_matches(
     df: pd.DataFrame,
     target_id: int,
@@ -310,9 +344,8 @@ def compute_matches(
         weights = {"zone": 0.25, "budget": 0.15, "dates": 0.20, "share": 0.10, "bath": 0.10, "age": 0.20}
 
     target = df[df["id"] == target_id].iloc[0]
-    tz = zones_set(target["zona"])
-
     rows = []
+
     for _, other in df.iterrows():
         if int(other["id"]) == int(target_id):
             continue
@@ -323,36 +356,9 @@ def compute_matches(
         if language_filter != "All" and str(other.get("idioma", "")).strip() != language_filter:
             continue
 
-        # Gender compatibility (hard filter)
-        if not match_genero_bidireccional(target, other):
+        scored = score_pair(target, other, min_overlap_days, require_zone, weights)
+        if scored is None:
             continue
-
-        # Zone
-        oz = zones_set(other["zona"])
-        zs = zone_score(tz, oz)
-        if require_zone and zs == 0:
-            continue
-
-        # Dates
-        odays = overlap_days(target["inicio"], target["fin"], other["inicio"], other["fin"])
-        ds = date_score(odays, min_days=min_overlap_days)
-
-        # Budget
-        bs = budget_score(float(target["budget"]), float(other["budget"]))
-
-        # Roomies
-        ss = share_score(target["max_compartir_con"], other["max_compartir_con"])
-        baths = bath_score(target["banos_min"], other["banos_min"])
-        ages = age_score(target["edad"], other["edad"])
-
-        score_total = (
-            weights["zone"] * zs +
-            weights["budget"] * bs +
-            weights["dates"] * ds +
-            weights["share"] * ss +
-            weights["bath"] * baths +
-            weights["age"] * ages
-        )
 
         rows.append({
             "match_id": int(other["id"]),
@@ -369,16 +375,7 @@ def compute_matches(
             "match_end": other.get("fin"),
             "match_max_share": int(other.get("max_compartir_con", 0)),
             "match_min_bath": int(other.get("banos_min", 1)),
-            "overlap_days": int(odays),
-
-            "score_zone": round(zs, 2),
-            "score_budget": round(bs, 2),
-            "score_dates": round(ds, 2),
-            "score_share": round(ss, 2),
-            "score_bath": round(baths, 2),
-            "score_age": round(ages, 2),
-
-            "score_total": round(score_total, 3),
+            **{k: round(v, 3) if isinstance(v, float) else v for k, v in scored.items()},
             "notes": other.get("notas", "")
         })
 
@@ -389,7 +386,14 @@ def compute_matches(
     return out
 
 
-# ---------------- WhatsApp message generator ----------------
+# ---------------- WhatsApp helpers ----------------
+def wa_digits(phone: str) -> str:
+    # WhatsApp wa.me expects digits only (no +)
+    if not phone:
+        return ""
+    return re.sub(r"[^\d]", "", str(phone))
+
+
 def generate_whatsapp_intro(target: pd.Series, match_row: pd.Series) -> str:
     return (
         f"Hi {match_row['match_name']}! 👋\n\n"
@@ -408,9 +412,164 @@ def generate_whatsapp_intro(target: pd.Series, match_row: pd.Series) -> str:
     )
 
 
+def whatsapp_web_link(phone: str, message: str) -> str:
+    digits = wa_digits(phone)
+    if not digits:
+        return ""
+    return f"https://wa.me/{digits}?text={quote(message)}"
+
+
+# ---------------- Group matching (3–4 people) ----------------
+def group_compatible(a: pd.Series, b: pd.Series) -> bool:
+    return match_genero_bidireccional(a, b)
+
+
+def compute_group_candidates(df: pd.DataFrame, target_id: int, candidate_ids: list[int]) -> dict[int, pd.Series]:
+    sub = df[df["id"].isin([target_id] + candidate_ids)]
+    return {int(r["id"]): r for _, r in sub.iterrows()}
+
+
+def group_score(
+    members: list[pd.Series],
+    weights: dict,
+    min_overlap_days: int,
+    require_zone: bool
+) -> float:
+    # Average pairwise score among all pairs
+    pairs = list(itertools.combinations(members, 2))
+    if not pairs:
+        return 0.0
+
+    scores = []
+    for a, b in pairs:
+        scored = score_pair(a, b, min_overlap_days, require_zone, weights)
+        if scored is None:
+            return -1.0  # incompatible
+        scores.append(scored["score_total"])
+
+    return float(sum(scores) / len(scores))
+
+
+def generate_groups(
+    df: pd.DataFrame,
+    target_id: int,
+    matches_df: pd.DataFrame,
+    group_size: int,
+    max_groups: int,
+    weights: dict,
+    min_overlap_days: int,
+    require_zone: bool
+) -> pd.DataFrame:
+    """
+    Uses top matches as pool and forms best groups that include the target.
+    """
+    if matches_df.empty:
+        return pd.DataFrame()
+
+    # Pool: top ~N matches
+    pool_ids = matches_df["match_id"].tolist()
+    pool_ids = [int(x) for x in pool_ids]
+
+    # Prepare members dict
+    members_map = compute_group_candidates(df, int(target_id), pool_ids)
+    target = members_map.get(int(target_id))
+    if target is None:
+        return pd.DataFrame()
+
+    # Choose group_size-1 from pool
+    combos = itertools.combinations(pool_ids, group_size - 1)
+
+    rows = []
+    for combo in combos:
+        ids = [int(target_id)] + [int(x) for x in combo]
+        members = [members_map[i] for i in ids if i in members_map]
+        if len(members) != group_size:
+            continue
+
+        # Hard compatibility check for all pairs (gender constraints)
+        ok = True
+        for a, b in itertools.combinations(members, 2):
+            if not group_compatible(a, b):
+                ok = False
+                break
+        if not ok:
+            continue
+
+        gscore = group_score(members, weights, min_overlap_days, require_zone)
+        if gscore < 0:
+            continue
+
+        # Respect "max_compartir_con": group_size-1 roommates
+        roommates_needed = group_size - 1
+        if int(target["max_compartir_con"]) < roommates_needed:
+            continue
+        # also each member must allow at least roommates_needed
+        if any(int(m["max_compartir_con"]) < roommates_needed for m in members):
+            continue
+
+        # Build readable summary
+        names = [f"{m['nombre']} ({m['edad']})" for m in members]
+        phones = [str(m.get("telefono", "")) for m in members]
+        countries = [str(m.get("pais", "")) for m in members]
+        langs = sorted(set(str(m.get("idioma", "")).strip() for m in members if str(m.get("idioma","")).strip()))
+
+        rows.append({
+            "group_size": group_size,
+            "group_score": round(gscore, 3),
+            "members": " | ".join(names),
+            "phones": " | ".join(phones),
+            "countries": " | ".join(countries),
+            "languages": ", ".join(langs),
+            "member_ids": ",".join(str(i) for i in ids),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("group_score", ascending=False).head(int(max_groups))
+    return out
+
+
+# ---------------- Dashboard ----------------
+def dashboard(df: pd.DataFrame):
+    st.subheader("📊 Dashboard")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total clients", int(len(df)))
+    with c2:
+        st.metric("Countries", int(df["pais"].nunique()) if "pais" in df.columns else 0)
+    with c3:
+        st.metric("Languages", int(df["idioma"].nunique()) if "idioma" in df.columns else 0)
+    with c4:
+        st.metric("Avg age", round(df["edad"].mean(), 1) if "edad" in df.columns and len(df) else "—")
+
+    # Top zones (explode multi-zones)
+    if "zona" in df.columns and len(df):
+        z = df["zona"].astype(str).str.replace(",", "|")
+        z = z.str.split("|").explode().str.strip()
+        z = z[z != ""]
+        top_z = z.value_counts().head(10)
+        st.markdown("**Top zones (Top 10)**")
+        st.bar_chart(top_z)
+
+    if "pais" in df.columns and len(df):
+        st.markdown("**Clients by country**")
+        st.bar_chart(df["pais"].value_counts())
+
+    if "idioma" in df.columns and len(df):
+        st.markdown("**Clients by language**")
+        st.bar_chart(df["idioma"].value_counts())
+
+    if "edad" in df.columns and len(df):
+        st.markdown("**Age distribution**")
+        age_bins = pd.cut(df["edad"], bins=[17, 20, 25, 30, 35, 40, 50, 80], right=True)
+        st.bar_chart(age_bins.value_counts().sort_index())
+
+
 # ---------------- UI ----------------
 st.set_page_config(page_title="Programa Match", layout="wide")
-st.title("🏡 Roommate Matching System (Advanced Scoring + WhatsApp Message)")
+st.title("🏡 Roommate Matching System — Dashboard + Groups + WhatsApp Export")
 
 init_db()
 
@@ -439,111 +598,258 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Import error: {e}")
 
-st.subheader("📋 Clients Database")
 df = load_clients()
-st.dataframe(df, use_container_width=True)
 
-st.divider()
+tab1, tab2, tab3 = st.tabs(["Dashboard", "Match (1-to-1)", "Group Match (3–4)"])
 
-st.subheader("💞 Matchmaking")
-
-if df.empty:
-    st.info("Upload clients to start matching.")
-else:
-    colA, colB, colC, colD = st.columns([2, 1, 1, 1])
-
-    with colA:
-        target_id = st.selectbox(
-            "Select client",
-            options=df["id"].tolist(),
-            format_func=lambda x: f"{int(x)} — {df[df['id'] == x].iloc[0]['nombre']} ({df[df['id'] == x].iloc[0].get('pais','')})"
-        )
-
-    with colB:
-        top_n = st.number_input("Top N", min_value=3, max_value=100, value=15)
-
-    with colC:
-        min_overlap_days = st.number_input("Min overlap (days)", min_value=1, max_value=365, value=30)
-
-    with colD:
-        require_zone = st.checkbox("Require same zone", value=True)
-
-    countries = ["All"] + sorted([c for c in df["pais"].dropna().unique().tolist() if str(c).strip() != ""])
-    languages = ["All"] + sorted([l for l in df["idioma"].dropna().unique().tolist() if str(l).strip() != ""])
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        country_filter = st.selectbox("Filter by country", options=countries)
-    with col2:
-        language_filter = st.selectbox("Filter by language", options=languages)
-
-    st.markdown("### Scoring weights (advanced)")
-    wcol1, wcol2, wcol3, wcol4, wcol5, wcol6 = st.columns(6)
-    with wcol1:
-        w_zone = st.slider("Zone", 0.0, 0.6, 0.25, 0.05)
-    with wcol2:
-        w_budget = st.slider("Budget", 0.0, 0.6, 0.15, 0.05)
-    with wcol3:
-        w_dates = st.slider("Dates", 0.0, 0.6, 0.20, 0.05)
-    with wcol4:
-        w_share = st.slider("Sharing", 0.0, 0.6, 0.10, 0.05)
-    with wcol5:
-        w_bath = st.slider("Bathrooms", 0.0, 0.6, 0.10, 0.05)
-    with wcol6:
-        w_age = st.slider("Age", 0.0, 0.6, 0.20, 0.05)
-
-    total_w = w_zone + w_budget + w_dates + w_share + w_bath + w_age
-    if total_w == 0:
-        st.warning("Set at least one weight > 0.")
-        weights = {"zone": 0, "budget": 0, "dates": 0, "share": 0, "bath": 0, "age": 0}
+with tab1:
+    if df.empty:
+        st.info("Upload clients to see the dashboard.")
     else:
-        weights = {
-            "zone": w_zone / total_w,
-            "budget": w_budget / total_w,
-            "dates": w_dates / total_w,
-            "share": w_share / total_w,
-            "bath": w_bath / total_w,
-            "age": w_age / total_w,
-        }
+        dashboard(df)
 
-    matches = compute_matches(
-        df=df,
-        target_id=int(target_id),
-        top_n=int(top_n),
-        min_overlap_days=int(min_overlap_days),
-        require_zone=bool(require_zone),
-        country_filter=country_filter,
-        language_filter=language_filter,
-        weights=weights
-    )
-
-    if matches.empty:
-        st.info("No matches found with the current filters/rules.")
+with tab2:
+    st.subheader("💞 Matchmaking (1-to-1)")
+    if df.empty:
+        st.info("Upload clients to start matching.")
     else:
-        st.markdown("### ✅ Matches (with advanced scoring breakdown)")
-        st.dataframe(matches, use_container_width=True)
+        colA, colB, colC, colD = st.columns([2, 1, 1, 1])
 
-        csv = matches.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download matches (CSV)", data=csv, file_name="matches_advanced.csv", mime="text/csv")
+        with colA:
+            target_id = st.selectbox(
+                "Select client",
+                options=df["id"].tolist(),
+                format_func=lambda x: f"{int(x)} — {df[df['id'] == x].iloc[0]['nombre']} ({df[df['id'] == x].iloc[0].get('pais','')})"
+            )
 
-        st.divider()
+        with colB:
+            top_n = st.number_input("Top N", min_value=3, max_value=100, value=15)
 
-        st.markdown("### 📲 Generate WhatsApp introduction message")
-        match_choice = st.selectbox(
-            "Select one match to generate a WhatsApp message",
-            options=matches["match_id"].tolist(),
-            format_func=lambda mid: f"{int(mid)} — {matches[matches['match_id']==mid].iloc[0]['match_name']} ({matches[matches['match_id']==mid].iloc[0]['match_country']})"
+        with colC:
+            min_overlap_days = st.number_input("Min overlap (days)", min_value=1, max_value=365, value=30)
+
+        with colD:
+            require_zone = st.checkbox("Require same zone", value=True)
+
+        countries = ["All"] + sorted([c for c in df["pais"].dropna().unique().tolist() if str(c).strip() != ""])
+        languages = ["All"] + sorted([l for l in df["idioma"].dropna().unique().tolist() if str(l).strip() != ""])
+
+        f1, f2 = st.columns([1, 1])
+        with f1:
+            country_filter = st.selectbox("Filter by country", options=countries)
+        with f2:
+            language_filter = st.selectbox("Filter by language", options=languages)
+
+        st.markdown("### Scoring weights (advanced)")
+        wcol1, wcol2, wcol3, wcol4, wcol5, wcol6 = st.columns(6)
+        with wcol1:
+            w_zone = st.slider("Zone", 0.0, 0.6, 0.25, 0.05)
+        with wcol2:
+            w_budget = st.slider("Budget", 0.0, 0.6, 0.15, 0.05)
+        with wcol3:
+            w_dates = st.slider("Dates", 0.0, 0.6, 0.20, 0.05)
+        with wcol4:
+            w_share = st.slider("Sharing", 0.0, 0.6, 0.10, 0.05)
+        with wcol5:
+            w_bath = st.slider("Bathrooms", 0.0, 0.6, 0.10, 0.05)
+        with wcol6:
+            w_age = st.slider("Age", 0.0, 0.6, 0.20, 0.05)
+
+        total_w = w_zone + w_budget + w_dates + w_share + w_bath + w_age
+        if total_w == 0:
+            st.warning("Set at least one weight > 0.")
+            weights = {"zone": 0, "budget": 0, "dates": 0, "share": 0, "bath": 0, "age": 0}
+        else:
+            weights = {
+                "zone": w_zone / total_w,
+                "budget": w_budget / total_w,
+                "dates": w_dates / total_w,
+                "share": w_share / total_w,
+                "bath": w_bath / total_w,
+                "age": w_age / total_w,
+            }
+
+        matches = compute_matches(
+            df=df,
+            target_id=int(target_id),
+            top_n=int(top_n),
+            min_overlap_days=int(min_overlap_days),
+            require_zone=bool(require_zone),
+            country_filter=country_filter,
+            language_filter=language_filter,
+            weights=weights
         )
 
-        target = df[df["id"] == int(target_id)].iloc[0]
-        match_row = matches[matches["match_id"] == int(match_choice)].iloc[0]
+        if matches.empty:
+            st.info("No matches found with the current filters/rules.")
+        else:
+            st.markdown("### ✅ Matches (advanced score breakdown)")
+            st.dataframe(matches, use_container_width=True)
 
-        msg = generate_whatsapp_intro(target, match_row)
-        st.text_area("WhatsApp message (copy & paste)", value=msg, height=260)
+            # Add WhatsApp links (for each match)
+            target = df[df["id"] == int(target_id)].iloc[0]
+            wa_rows = []
+            for _, r in matches.iterrows():
+                msg = generate_whatsapp_intro(target, r)
+                link = whatsapp_web_link(r.get("match_phone", ""), msg)
+                wa_rows.append({
+                    "match_id": r["match_id"],
+                    "match_name": r["match_name"],
+                    "match_phone": r.get("match_phone", ""),
+                    "whatsapp_link": link
+                })
+            wa_df = pd.DataFrame(wa_rows)
 
-        st.download_button(
-            "⬇️ Download message as .txt",
-            data=msg.encode("utf-8"),
-            file_name="whatsapp_intro.txt",
-            mime="text/plain"
+            st.markdown("### 📲 WhatsApp Web links (click to open)")
+            st.dataframe(wa_df, use_container_width=True)
+
+            csv = matches.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download matches (CSV)", data=csv, file_name="matches_advanced.csv", mime="text/csv")
+
+            wa_csv = wa_df.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download WhatsApp links (CSV)", data=wa_csv, file_name="whatsapp_links.csv", mime="text/csv")
+
+            st.divider()
+
+            st.markdown("### ✍️ Generate WhatsApp introduction message")
+            match_choice = st.selectbox(
+                "Pick one match",
+                options=matches["match_id"].tolist(),
+                format_func=lambda mid: f"{int(mid)} — {matches[matches['match_id']==mid].iloc[0]['match_name']} ({matches[matches['match_id']==mid].iloc[0]['match_country']})"
+            )
+
+            match_row = matches[matches["match_id"] == int(match_choice)].iloc[0]
+            msg = generate_whatsapp_intro(target, match_row)
+            st.text_area("Message (copy & paste)", value=msg, height=260)
+
+            link = whatsapp_web_link(match_row.get("match_phone", ""), msg)
+            if link:
+                st.link_button("Open WhatsApp Web with message", link)
+
+            st.download_button(
+                "⬇️ Download message as .txt",
+                data=msg.encode("utf-8"),
+                file_name="whatsapp_intro.txt",
+                mime="text/plain"
+            )
+
+with tab3:
+    st.subheader("👥 Group Matching (3–4 people)")
+    if df.empty:
+        st.info("Upload clients to start group matching.")
+    else:
+        colA, colB, colC, colD = st.columns([2, 1, 1, 1])
+        with colA:
+            target_id_g = st.selectbox(
+                "Select client (group anchor)",
+                options=df["id"].tolist(),
+                format_func=lambda x: f"{int(x)} — {df[df['id'] == x].iloc[0]['nombre']} ({df[df['id'] == x].iloc[0].get('pais','')})",
+                key="target_group"
+            )
+        with colB:
+            pool_top = st.number_input("Pool size (from top matches)", min_value=10, max_value=100, value=30)
+        with colC:
+            group_size = st.selectbox("Group size", options=[3, 4], index=1)
+        with colD:
+            max_groups = st.number_input("Max groups to show", min_value=5, max_value=100, value=20)
+
+        min_overlap_days_g = st.number_input("Min overlap (days)", min_value=1, max_value=365, value=30, key="min_overlap_group")
+        require_zone_g = st.checkbox("Require same zone", value=True, key="req_zone_group")
+
+        countries = ["All"] + sorted([c for c in df["pais"].dropna().unique().tolist() if str(c).strip() != ""])
+        languages = ["All"] + sorted([l for l in df["idioma"].dropna().unique().tolist() if str(l).strip() != ""])
+
+        f1, f2 = st.columns([1, 1])
+        with f1:
+            country_filter_g = st.selectbox("Filter by country", options=countries, key="country_group")
+        with f2:
+            language_filter_g = st.selectbox("Filter by language", options=languages, key="lang_group")
+
+        st.markdown("### Scoring weights (used for group score)")
+        wcol1, wcol2, wcol3, wcol4, wcol5, wcol6 = st.columns(6)
+        with wcol1:
+            w_zone_g = st.slider("Zone", 0.0, 0.6, 0.25, 0.05, key="wz_g")
+        with wcol2:
+            w_budget_g = st.slider("Budget", 0.0, 0.6, 0.15, 0.05, key="wb_g")
+        with wcol3:
+            w_dates_g = st.slider("Dates", 0.0, 0.6, 0.20, 0.05, key="wd_g")
+        with wcol4:
+            w_share_g = st.slider("Sharing", 0.0, 0.6, 0.10, 0.05, key="ws_g")
+        with wcol5:
+            w_bath_g = st.slider("Bathrooms", 0.0, 0.6, 0.10, 0.05, key="wba_g")
+        with wcol6:
+            w_age_g = st.slider("Age", 0.0, 0.6, 0.20, 0.05, key="wa_g")
+
+        total_wg = w_zone_g + w_budget_g + w_dates_g + w_share_g + w_bath_g + w_age_g
+        if total_wg == 0:
+            st.warning("Set at least one weight > 0.")
+            weights_g = {"zone": 0, "budget": 0, "dates": 0, "share": 0, "bath": 0, "age": 0}
+        else:
+            weights_g = {
+                "zone": w_zone_g / total_wg,
+                "budget": w_budget_g / total_wg,
+                "dates": w_dates_g / total_wg,
+                "share": w_share_g / total_wg,
+                "bath": w_bath_g / total_wg,
+                "age": w_age_g / total_wg,
+            }
+
+        # Build pool with 1-to-1 matches first
+        pool_matches = compute_matches(
+            df=df,
+            target_id=int(target_id_g),
+            top_n=int(pool_top),
+            min_overlap_days=int(min_overlap_days_g),
+            require_zone=bool(require_zone_g),
+            country_filter=country_filter_g,
+            language_filter=language_filter_g,
+            weights=weights_g
         )
+
+        if pool_matches.empty:
+            st.info("No candidates for group formation with current filters.")
+        else:
+            groups = generate_groups(
+                df=df,
+                target_id=int(target_id_g),
+                matches_df=pool_matches,
+                group_size=int(group_size),
+                max_groups=int(max_groups),
+                weights=weights_g,
+                min_overlap_days=int(min_overlap_days_g),
+                require_zone=bool(require_zone_g)
+            )
+
+            if groups.empty:
+                st.info("No compatible groups found from the current pool.")
+            else:
+                st.markdown("### ✅ Best groups")
+                st.dataframe(groups, use_container_width=True)
+
+                g_csv = groups.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download groups (CSV)", data=g_csv, file_name="groups.csv", mime="text/csv")
+
+                st.divider()
+                st.markdown("### 📲 WhatsApp (Group intro message)")
+                # pick best group
+                group_pick = st.selectbox(
+                    "Pick a group",
+                    options=list(range(len(groups))),
+                    format_func=lambda i: f"Score {groups.iloc[i]['group_score']} — {groups.iloc[i]['members'][:60]}...",
+                    key="group_pick"
+                )
+                grp = groups.iloc[int(group_pick)]
+                member_ids = [int(x) for x in str(grp["member_ids"]).split(",") if str(x).strip().isdigit()]
+                members = df[df["id"].isin(member_ids)].copy()
+
+                # Simple group message
+                names_list = ", ".join(members["nombre"].tolist())
+                phones_list = " | ".join(members["telefono"].tolist())
+                msg = (
+                    "Hi everyone! 👋\n\n"
+                    "I'm introducing you because you look like a strong roommate group match.\n\n"
+                    f"Group members: {names_list}\n"
+                    f"Phones: {phones_list}\n\n"
+                    "If you're all happy, feel free to create a group chat and set up a quick call 😊"
+                )
+                st.text_area("Group message (copy & paste)", value=msg, height=220)
