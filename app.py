@@ -1,14 +1,23 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import datetime
+from datetime import date
 
-DB_PATH = "match.db"
+# Nueva DB para evitar conflicto con la versión anterior
+DB_PATH = "match_v2.db"
 
-REQUIRED_COLS = ["nombre", "zona", "budget", "inicio", "fin"]
+# Columnas obligatorias (incluye nuevas)
+REQUIRED_COLS = [
+    "nombre", "zona", "budget", "inicio", "fin",
+    "max_compartir_con", "banos_min", "preferencia"
+]
+
+VALID_PREF = {"mixto", "solo_ninas", "solo_ninos"}
+
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 def init_db():
     conn = get_conn()
@@ -21,59 +30,94 @@ def init_db():
             budget REAL NOT NULL,
             inicio TEXT NOT NULL,
             fin TEXT NOT NULL,
+            max_compartir_con INTEGER NOT NULL,
+            banos_min INTEGER NOT NULL,
+            preferencia TEXT NOT NULL,
             notas TEXT
         )
     """)
     conn.commit()
     conn.close()
 
+
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
 
+    # Validación columnas
     for col in REQUIRED_COLS:
         if col not in df.columns:
             raise ValueError(f"Falta la columna obligatoria: {col}")
 
-    # Limpieza básica
-    df["nombre"] = df["nombre"].astype(str).str.strip()
-    df["zona"] = df["zona"].astype(str).str.strip()
-    df["budget"] = pd.to_numeric(df["budget"], errors="coerce")
-    df["inicio"] = pd.to_datetime(df["inicio"], errors="coerce").dt.date
-    df["fin"] = pd.to_datetime(df["fin"], errors="coerce").dt.date
-
     if "notas" not in df.columns:
         df["notas"] = ""
 
-    # Eliminar filas inválidas
-    df = df.dropna(subset=["nombre", "zona", "budget", "inicio", "fin"])
+    # Limpieza
+    df["nombre"] = df["nombre"].astype(str).str.strip()
+    df["zona"] = df["zona"].astype(str).str.strip()
+
+    df["budget"] = pd.to_numeric(df["budget"], errors="coerce")
+
+    df["inicio"] = pd.to_datetime(df["inicio"], errors="coerce").dt.date
+    df["fin"] = pd.to_datetime(df["fin"], errors="coerce").dt.date
+
+    df["max_compartir_con"] = pd.to_numeric(df["max_compartir_con"], errors="coerce")
+    df["banos_min"] = pd.to_numeric(df["banos_min"], errors="coerce")
+
+    df["preferencia"] = df["preferencia"].astype(str).str.strip().str.lower()
+    df.loc[~df["preferencia"].isin(VALID_PREF), "preferencia"] = "mixto"
+
+    df["notas"] = df["notas"].astype(str).fillna("").str.strip()
+
+    # Filas inválidas
+    df = df.dropna(subset=[
+        "nombre", "zona", "budget", "inicio", "fin",
+        "max_compartir_con", "banos_min"
+    ])
     df = df[df["fin"] >= df["inicio"]]
+
+    # Enteros
+    df["max_compartir_con"] = df["max_compartir_con"].astype(int)
+    df["banos_min"] = df["banos_min"].astype(int)
+
+    # mínimos razonables
+    df = df[(df["max_compartir_con"] >= 0) & (df["banos_min"] >= 1)]
 
     return df
 
+
 def upsert_clients(df: pd.DataFrame):
-    # MVP simple: insertamos todo (si quieres deduplicación, lo mejoramos por nombre+inicio+fin o un id externo)
+    # MVP: append (si quieres deduplicación por nombre+inicio+fin lo hacemos después)
     conn = get_conn()
     df2 = df.copy()
     df2["inicio"] = df2["inicio"].astype(str)
     df2["fin"] = df2["fin"].astype(str)
-    df2[["nombre","zona","budget","inicio","fin","notas"]].to_sql("clientes", conn, if_exists="append", index=False)
+
+    df2[[
+        "nombre", "zona", "budget", "inicio", "fin",
+        "max_compartir_con", "banos_min", "preferencia", "notas"
+    ]].to_sql("clientes", conn, if_exists="append", index=False)
+
     conn.close()
+
 
 def load_clients() -> pd.DataFrame:
     conn = get_conn()
     df = pd.read_sql_query("SELECT * FROM clientes", conn)
     conn.close()
+
     if df.empty:
         return df
+
     df["inicio"] = pd.to_datetime(df["inicio"]).dt.date
     df["fin"] = pd.to_datetime(df["fin"]).dt.date
     return df
 
+
 def zones_set(zona: str):
-    # Permite múltiples zonas separadas por | o , 
-    parts = [z.strip().lower() for z in zona.replace(",", "|").split("|")]
+    parts = [z.strip().lower() for z in str(zona).replace(",", "|").split("|")]
     return set([p for p in parts if p])
+
 
 def overlap_days(a_start, a_end, b_start, b_end) -> int:
     start = max(a_start, b_start)
@@ -82,26 +126,61 @@ def overlap_days(a_start, a_end, b_start, b_end) -> int:
         return 0
     return (end - start).days + 1
 
+
 def budget_score(b1, b2, tolerance=0.20):
-    # score 1 si están dentro de ±tolerance, cae linealmente hasta 0
     if b1 <= 0 or b2 <= 0:
         return 0.0
     ratio = abs(b1 - b2) / max(b1, b2)
     if ratio <= tolerance:
         return 1.0
-    # penalización suave
-    return max(0.0, 1.0 - (ratio - tolerance) / 0.50)  # a 70% diff => 0 aprox.
+    return max(0.0, 1.0 - (ratio - tolerance) / 0.50)
+
 
 def date_score(days_overlap, min_days=30):
-    # 1 si overlap >= min_days, si no, proporcional
     return min(1.0, days_overlap / float(min_days))
+
 
 def zone_score(z1, z2):
     return 1.0 if len(z1.intersection(z2)) > 0 else 0.0
 
-def compute_matches(df: pd.DataFrame, target_id: int, top_n=10,
-                    w_zone=0.45, w_budget=0.25, w_dates=0.30,
-                    min_overlap_days=30, require_zone=True):
+
+def preference_compatible(p1: str, p2: str) -> bool:
+    p1 = (p1 or "mixto").lower()
+    p2 = (p2 or "mixto").lower()
+    if p1 == "mixto" or p2 == "mixto":
+        return True
+    return p1 == p2
+
+
+def share_score(s1, s2):
+    try:
+        s1, s2 = int(s1), int(s2)
+        diff = abs(s1 - s2)
+        return max(0.0, 1.0 - diff / 3.0)  # diff 0 => 1, diff 3 => 0
+    except Exception:
+        return 0.5
+
+
+def bath_score(b1, b2):
+    # si piden lo mismo, 1.0; si difiere 1 baño, 0.7; más, 0.3
+    try:
+        d = abs(int(b1) - int(b2))
+        if d == 0:
+            return 1.0
+        if d == 1:
+            return 0.7
+        return 0.3
+    except Exception:
+        return 0.5
+
+
+def compute_matches(
+    df: pd.DataFrame,
+    target_id: int,
+    top_n=10,
+    min_overlap_days=30,
+    require_zone=True,
+):
     if df.empty:
         return df
 
@@ -113,17 +192,35 @@ def compute_matches(df: pd.DataFrame, target_id: int, top_n=10,
         if int(other["id"]) == int(target_id):
             continue
 
+        # Preferencia (filtro duro)
+        if not preference_compatible(target.get("preferencia"), other.get("preferencia")):
+            continue
+
+        # Zona
         oz = zones_set(other["zona"])
         zs = zone_score(tz, oz)
-
         if require_zone and zs == 0:
             continue
 
+        # Fechas
         odays = overlap_days(target["inicio"], target["fin"], other["inicio"], other["fin"])
         ds = date_score(odays, min_days=min_overlap_days)
-        bs = budget_score(target["budget"], other["budget"])
 
-        score = (w_zone * zs) + (w_budget * bs) + (w_dates * ds)
+        # Budget
+        bs = budget_score(float(target["budget"]), float(other["budget"]))
+
+        # Nuevos scores
+        ss = share_score(target.get("max_compartir_con"), other.get("max_compartir_con"))
+        baths = bath_score(target.get("banos_min"), other.get("banos_min"))
+
+        # Pesos (ajustados para roomies)
+        score = (
+            0.30 * zs +
+            0.20 * bs +
+            0.25 * ds +
+            0.15 * ss +
+            0.10 * baths
+        )
 
         rows.append({
             "match_id": int(other["id"]),
@@ -133,9 +230,14 @@ def compute_matches(df: pd.DataFrame, target_id: int, top_n=10,
             "inicio": other["inicio"],
             "fin": other["fin"],
             "overlap_dias": odays,
+            "preferencia": other.get("preferencia", "mixto"),
+            "max_compartir_con": int(other.get("max_compartir_con", 0)),
+            "banos_min": int(other.get("banos_min", 1)),
             "score_zona": round(zs, 2),
             "score_budget": round(bs, 2),
             "score_fechas": round(ds, 2),
+            "score_compartir": round(ss, 2),
+            "score_banos": round(baths, 2),
             "score_total": round(score, 3),
             "notas": other.get("notas", "")
         })
@@ -143,9 +245,10 @@ def compute_matches(df: pd.DataFrame, target_id: int, top_n=10,
     out = pd.DataFrame(rows).sort_values("score_total", ascending=False).head(top_n)
     return out
 
+
 # ---------------- UI ----------------
 st.set_page_config(page_title="Programa Match", layout="wide")
-st.title("🏡 Programa Match — Clientes")
+st.title("🏡 Programa Match — Clientes (Roomies)")
 
 init_db()
 
@@ -153,6 +256,14 @@ with st.sidebar:
     st.header("Importar clientes")
     file = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
     sheet_name = st.text_input("Nombre de la hoja", value="clientes")
+
+    st.caption("Columnas obligatorias:")
+    st.code(
+        "nombre, zona, budget, inicio, fin, max_compartir_con, banos_min, preferencia, (notas opcional)",
+        language="text"
+    )
+    st.caption("preferencia: mixto | solo_ninas | solo_ninos")
+
     if st.button("Importar a base de datos", type="primary"):
         if file is None:
             st.warning("Sube un Excel primero.")
@@ -175,43 +286,35 @@ st.subheader("💞 Matching")
 if df.empty:
     st.info("Importa clientes para empezar.")
 else:
-    col1, col2, col3, col4 = st.columns([2,1,1,1])
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
     with col1:
         target_id = st.selectbox(
             "Elige cliente",
             options=df["id"].tolist(),
-            format_func=lambda x: f"{int(x)} — {df[df['id']==x].iloc[0]['nombre']}"
+            format_func=lambda x: f"{int(x)} — {df[df['id'] == x].iloc[0]['nombre']}"
         )
+
     with col2:
         top_n = st.number_input("Top N", min_value=3, max_value=50, value=10)
+
     with col3:
         min_overlap_days = st.number_input("Mín. solape (días)", min_value=1, max_value=365, value=30)
+
     with col4:
         require_zone = st.checkbox("Exigir misma zona", value=True)
 
-    w_zone = st.slider("Peso zona", 0.0, 1.0, 0.45)
-    w_budget = st.slider("Peso budget", 0.0, 1.0, 0.25)
-    w_dates = st.slider("Peso fechas", 0.0, 1.0, 0.30)
+    matches = compute_matches(
+        df=df,
+        target_id=int(target_id),
+        top_n=int(top_n),
+        min_overlap_days=int(min_overlap_days),
+        require_zone=require_zone
+    )
 
-    # Normaliza pesos por si el usuario los cambia raro
-    total_w = w_zone + w_budget + w_dates
-    if total_w == 0:
-        st.warning("Ajusta pesos (no pueden ser todos 0).")
-    else:
-        w_zone, w_budget, w_dates = w_zone/total_w, w_budget/total_w, w_dates/total_w
+    st.write("✅ Resultados")
+    st.dataframe(matches, use_container_width=True)
 
-        matches = compute_matches(
-            df, int(target_id),
-            top_n=int(top_n),
-            w_zone=w_zone, w_budget=w_budget, w_dates=w_dates,
-            min_overlap_days=int(min_overlap_days),
-            require_zone=require_zone
-        )
-
-        st.write("✅ Resultados")
-        st.dataframe(matches, use_container_width=True)
-
-        if not matches.empty:
-            csv = matches.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Descargar matches (CSV)", data=csv, file_name="matches.csv", mime="text/csv")
+    if not matches.empty:
+        csv = matches.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar matches (CSV)", data=csv, file_name="matches.csv", mime="text/csv")
