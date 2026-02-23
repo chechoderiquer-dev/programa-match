@@ -290,7 +290,6 @@ def match_genero_bidireccional(t: pd.Series, o: pd.Series) -> bool:
 
 
 def score_pair(target: pd.Series, other: pd.Series, min_overlap_days: int, require_zone: bool, weights: dict):
-    # Gender hard filter
     if not match_genero_bidireccional(target, other):
         return None
 
@@ -350,7 +349,6 @@ def compute_matches(
         if int(other["id"]) == int(target_id):
             continue
 
-        # Filters
         if country_filter != "All" and other.get("pais", "") != country_filter:
             continue
         if language_filter != "All" and str(other.get("idioma", "")).strip() != language_filter:
@@ -388,7 +386,6 @@ def compute_matches(
 
 # ---------------- WhatsApp helpers ----------------
 def wa_digits(phone: str) -> str:
-    # WhatsApp wa.me expects digits only (no +)
     if not phone:
         return ""
     return re.sub(r"[^\d]", "", str(phone))
@@ -424,29 +421,16 @@ def group_compatible(a: pd.Series, b: pd.Series) -> bool:
     return match_genero_bidireccional(a, b)
 
 
-def compute_group_candidates(df: pd.DataFrame, target_id: int, candidate_ids: list[int]) -> dict[int, pd.Series]:
-    sub = df[df["id"].isin([target_id] + candidate_ids)]
-    return {int(r["id"]): r for _, r in sub.iterrows()}
-
-
-def group_score(
-    members: list[pd.Series],
-    weights: dict,
-    min_overlap_days: int,
-    require_zone: bool
-) -> float:
-    # Average pairwise score among all pairs
+def group_score(members: list[pd.Series], weights: dict, min_overlap_days: int, require_zone: bool) -> float:
     pairs = list(itertools.combinations(members, 2))
     if not pairs:
         return 0.0
-
     scores = []
     for a, b in pairs:
         scored = score_pair(a, b, min_overlap_days, require_zone, weights)
         if scored is None:
-            return -1.0  # incompatible
+            return -1.0
         scores.append(scored["score_total"])
-
     return float(sum(scores) / len(scores))
 
 
@@ -460,23 +444,15 @@ def generate_groups(
     min_overlap_days: int,
     require_zone: bool
 ) -> pd.DataFrame:
-    """
-    Uses top matches as pool and forms best groups that include the target.
-    """
     if matches_df.empty:
         return pd.DataFrame()
 
-    # Pool: top ~N matches
-    pool_ids = matches_df["match_id"].tolist()
-    pool_ids = [int(x) for x in pool_ids]
-
-    # Prepare members dict
-    members_map = compute_group_candidates(df, int(target_id), pool_ids)
+    pool_ids = [int(x) for x in matches_df["match_id"].tolist()]
+    members_map = {int(r["id"]): r for _, r in df[df["id"].isin([target_id] + pool_ids)].iterrows()}
     target = members_map.get(int(target_id))
     if target is None:
         return pd.DataFrame()
 
-    # Choose group_size-1 from pool
     combos = itertools.combinations(pool_ids, group_size - 1)
 
     rows = []
@@ -486,7 +462,7 @@ def generate_groups(
         if len(members) != group_size:
             continue
 
-        # Hard compatibility check for all pairs (gender constraints)
+        # Hard gender constraints for all pairs
         ok = True
         for a, b in itertools.combinations(members, 2):
             if not group_compatible(a, b):
@@ -495,23 +471,19 @@ def generate_groups(
         if not ok:
             continue
 
+        # Respect max_compartir_con for all members
+        roommates_needed = group_size - 1
+        if any(int(m["max_compartir_con"]) < roommates_needed for m in members):
+            continue
+
         gscore = group_score(members, weights, min_overlap_days, require_zone)
         if gscore < 0:
             continue
 
-        # Respect "max_compartir_con": group_size-1 roommates
-        roommates_needed = group_size - 1
-        if int(target["max_compartir_con"]) < roommates_needed:
-            continue
-        # also each member must allow at least roommates_needed
-        if any(int(m["max_compartir_con"]) < roommates_needed for m in members):
-            continue
-
-        # Build readable summary
         names = [f"{m['nombre']} ({m['edad']})" for m in members]
         phones = [str(m.get("telefono", "")) for m in members]
         countries = [str(m.get("pais", "")) for m in members]
-        langs = sorted(set(str(m.get("idioma", "")).strip() for m in members if str(m.get("idioma","")).strip()))
+        langs = sorted(set(str(m.get("idioma", "")).strip() for m in members if str(m.get("idioma", "")).strip()))
 
         rows.append({
             "group_size": group_size,
@@ -530,7 +502,7 @@ def generate_groups(
     return out
 
 
-# ---------------- Dashboard ----------------
+# ---------------- Dashboard (FIXED) ----------------
 def dashboard(df: pd.DataFrame):
     st.subheader("📊 Dashboard")
 
@@ -544,7 +516,7 @@ def dashboard(df: pd.DataFrame):
     with c4:
         st.metric("Avg age", round(df["edad"].mean(), 1) if "edad" in df.columns and len(df) else "—")
 
-    # Top zones (explode multi-zones)
+    # Top zones
     if "zona" in df.columns and len(df):
         z = df["zona"].astype(str).str.replace(",", "|")
         z = z.str.split("|").explode().str.strip()
@@ -561,10 +533,13 @@ def dashboard(df: pd.DataFrame):
         st.markdown("**Clients by language**")
         st.bar_chart(df["idioma"].value_counts())
 
+    # ✅ FIX: convert Interval index to string so Altair doesn't crash
     if "edad" in df.columns and len(df):
         st.markdown("**Age distribution**")
         age_bins = pd.cut(df["edad"], bins=[17, 20, 25, 30, 35, 40, 50, 80], right=True)
-        st.bar_chart(age_bins.value_counts().sort_index())
+        counts = age_bins.value_counts().sort_index()
+        counts.index = counts.index.astype(str)  # <- critical fix
+        st.bar_chart(counts)
 
 
 # ---------------- UI ----------------
@@ -686,7 +661,6 @@ with tab2:
             st.markdown("### ✅ Matches (advanced score breakdown)")
             st.dataframe(matches, use_container_width=True)
 
-            # Add WhatsApp links (for each match)
             target = df[df["id"] == int(target_id)].iloc[0]
             wa_rows = []
             for _, r in matches.iterrows():
@@ -703,11 +677,19 @@ with tab2:
             st.markdown("### 📲 WhatsApp Web links (click to open)")
             st.dataframe(wa_df, use_container_width=True)
 
-            csv = matches.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download matches (CSV)", data=csv, file_name="matches_advanced.csv", mime="text/csv")
+            st.download_button(
+                "⬇️ Download matches (CSV)",
+                data=matches.to_csv(index=False).encode("utf-8"),
+                file_name="matches_advanced.csv",
+                mime="text/csv"
+            )
 
-            wa_csv = wa_df.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download WhatsApp links (CSV)", data=wa_csv, file_name="whatsapp_links.csv", mime="text/csv")
+            st.download_button(
+                "⬇️ Download WhatsApp links (CSV)",
+                data=wa_df.to_csv(index=False).encode("utf-8"),
+                file_name="whatsapp_links.csv",
+                mime="text/csv"
+            )
 
             st.divider()
 
@@ -725,13 +707,6 @@ with tab2:
             link = whatsapp_web_link(match_row.get("match_phone", ""), msg)
             if link:
                 st.link_button("Open WhatsApp Web with message", link)
-
-            st.download_button(
-                "⬇️ Download message as .txt",
-                data=msg.encode("utf-8"),
-                file_name="whatsapp_intro.txt",
-                mime="text/plain"
-            )
 
 with tab3:
     st.subheader("👥 Group Matching (3–4 people)")
@@ -765,36 +740,28 @@ with tab3:
         with f2:
             language_filter_g = st.selectbox("Filter by language", options=languages, key="lang_group")
 
-        st.markdown("### Scoring weights (used for group score)")
-        wcol1, wcol2, wcol3, wcol4, wcol5, wcol6 = st.columns(6)
-        with wcol1:
-            w_zone_g = st.slider("Zone", 0.0, 0.6, 0.25, 0.05, key="wz_g")
-        with wcol2:
-            w_budget_g = st.slider("Budget", 0.0, 0.6, 0.15, 0.05, key="wb_g")
-        with wcol3:
-            w_dates_g = st.slider("Dates", 0.0, 0.6, 0.20, 0.05, key="wd_g")
-        with wcol4:
-            w_share_g = st.slider("Sharing", 0.0, 0.6, 0.10, 0.05, key="ws_g")
-        with wcol5:
-            w_bath_g = st.slider("Bathrooms", 0.0, 0.6, 0.10, 0.05, key="wba_g")
-        with wcol6:
-            w_age_g = st.slider("Age", 0.0, 0.6, 0.20, 0.05, key="wa_g")
+        # weights reused from simple sliders to keep UI lighter
+        wg_zone = st.slider("Group weight: Zone", 0.0, 0.6, 0.25, 0.05, key="gwz")
+        wg_budget = st.slider("Group weight: Budget", 0.0, 0.6, 0.15, 0.05, key="gwb")
+        wg_dates = st.slider("Group weight: Dates", 0.0, 0.6, 0.20, 0.05, key="gwd")
+        wg_share = st.slider("Group weight: Sharing", 0.0, 0.6, 0.10, 0.05, key="gws")
+        wg_bath = st.slider("Group weight: Bathrooms", 0.0, 0.6, 0.10, 0.05, key="gwba")
+        wg_age = st.slider("Group weight: Age", 0.0, 0.6, 0.20, 0.05, key="gwa")
 
-        total_wg = w_zone_g + w_budget_g + w_dates_g + w_share_g + w_bath_g + w_age_g
+        total_wg = wg_zone + wg_budget + wg_dates + wg_share + wg_bath + wg_age
         if total_wg == 0:
-            st.warning("Set at least one weight > 0.")
+            st.warning("Set at least one group weight > 0.")
             weights_g = {"zone": 0, "budget": 0, "dates": 0, "share": 0, "bath": 0, "age": 0}
         else:
             weights_g = {
-                "zone": w_zone_g / total_wg,
-                "budget": w_budget_g / total_wg,
-                "dates": w_dates_g / total_wg,
-                "share": w_share_g / total_wg,
-                "bath": w_bath_g / total_wg,
-                "age": w_age_g / total_wg,
+                "zone": wg_zone / total_wg,
+                "budget": wg_budget / total_wg,
+                "dates": wg_dates / total_wg,
+                "share": wg_share / total_wg,
+                "bath": wg_bath / total_wg,
+                "age": wg_age / total_wg,
             }
 
-        # Build pool with 1-to-1 matches first
         pool_matches = compute_matches(
             df=df,
             target_id=int(target_id_g),
@@ -826,12 +793,15 @@ with tab3:
                 st.markdown("### ✅ Best groups")
                 st.dataframe(groups, use_container_width=True)
 
-                g_csv = groups.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download groups (CSV)", data=g_csv, file_name="groups.csv", mime="text/csv")
+                st.download_button(
+                    "⬇️ Download groups (CSV)",
+                    data=groups.to_csv(index=False).encode("utf-8"),
+                    file_name="groups.csv",
+                    mime="text/csv"
+                )
 
                 st.divider()
-                st.markdown("### 📲 WhatsApp (Group intro message)")
-                # pick best group
+                st.markdown("### 📲 Group intro message")
                 group_pick = st.selectbox(
                     "Pick a group",
                     options=list(range(len(groups))),
@@ -842,7 +812,6 @@ with tab3:
                 member_ids = [int(x) for x in str(grp["member_ids"]).split(",") if str(x).strip().isdigit()]
                 members = df[df["id"].isin(member_ids)].copy()
 
-                # Simple group message
                 names_list = ", ".join(members["nombre"].tolist())
                 phones_list = " | ".join(members["telefono"].tolist())
                 msg = (
