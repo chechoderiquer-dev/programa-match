@@ -760,6 +760,10 @@ def group_avg_budget(group_df: pd.DataFrame) -> float:
     return float(group_df["budget"].mean())
 
 
+def group_total_budget(group_df: pd.DataFrame) -> float:
+    return float(group_df["budget"].sum())
+
+
 def compute_group_matches(
     df: pd.DataFrame,
     target_id: int,
@@ -779,7 +783,6 @@ def compute_group_matches(
     if target_df.empty:
         return pd.DataFrame()
 
-    target = target_df.iloc[0]
     other_ids = [int(x) for x in df[df["id"] != int(target_id)]["id"].tolist()]
     if len(other_ids) < group_size - 1:
         return pd.DataFrame()
@@ -827,7 +830,7 @@ def compute_group_matches(
         member_lines = []
         for _, row in group_df.sort_values("nombre").iterrows():
             member_lines.append(
-                f"{row['nombre']} | {row['edad']} años | {row['telefono']} | {row['zona']}"
+                f"{row['nombre']} | {row['edad']} años | {row['telefono']} | {row['zona']} | Budget: €{int(row['budget'])}"
             )
 
         rows.append({
@@ -840,6 +843,7 @@ def compute_group_matches(
             "group_end": earliest_end,
             "group_overlap_days": overlap,
             "group_avg_budget": round(group_avg_budget(group_df), 2),
+            "group_total_budget": round(group_total_budget(group_df), 2),
             "score_total": round(avg_total, 4),
             "score_dates": round(avg_dates, 4),
             "score_zone": round(avg_zone, 4),
@@ -885,12 +889,17 @@ def build_copy_text_for_1to1(target: pd.Series, matches: pd.DataFrame) -> str:
     lines.append("")
 
     for idx, (_, r) in enumerate(matches.iterrows(), start=1):
+        total_budget = float(target["budget"]) + float(r["match_budget"])
+
         lines.append(f"{idx}. {r['match_name']}")
         lines.append(f"Contacto: {r['match_phone']}")
         lines.append(f"Edad: {r['match_age']}")
         lines.append(f"Zona match: {r['match_zone']}")
         lines.append(f"Fechas: {r['match_start']} a {r['match_end']}")
         lines.append(f"Overlap: {r['overlap_days']} días")
+        lines.append(f"Budget persona seleccionada: €{int(target['budget'])}")
+        lines.append(f"Budget match: €{int(r['match_budget'])}")
+        lines.append(f"Budget total entre ambos: €{int(total_budget)}")
         lines.append(f"Score total: {round(float(r['score_total']) * 100, 1)}%")
         lines.append("")
 
@@ -910,6 +919,8 @@ def build_copy_text_for_groups(target: pd.Series, groups_df: pd.DataFrame) -> st
         lines.append(f"Zona match: {g['group_common_zone']}")
         lines.append(f"Fechas en común: {g['group_start']} a {g['group_end']}")
         lines.append(f"Overlap grupo: {g['group_overlap_days']} días")
+        lines.append(f"Budget total del grupo: €{int(g['group_total_budget'])}")
+        lines.append(f"Budget promedio del grupo: €{int(g['group_avg_budget'])}")
         lines.append(f"Score total grupo: {round(float(g['score_total']) * 100, 1)}%")
         lines.append("Integrantes:")
         for member_line in str(g["members_detail"]).split("\n"):
@@ -920,6 +931,7 @@ def build_copy_text_for_groups(target: pd.Series, groups_df: pd.DataFrame) -> st
 
 
 def generate_whatsapp_intro_for_pair(target: pd.Series, match_row: pd.Series) -> str:
+    total_budget = float(target["budget"]) + float(match_row["match_budget"])
     return (
         f"Hola {match_row['match_name']} 👋\n\n"
         f"Te comparto un posible roommate match:\n\n"
@@ -929,6 +941,7 @@ def generate_whatsapp_intro_for_pair(target: pd.Series, match_row: pd.Series) ->
         f"Zona: {target['zona']}\n"
         f"Fechas: {target['inicio']} a {target['fin']}\n"
         f"Budget: €{int(target['budget'])}\n"
+        f"Budget total entre ambos: €{int(total_budget)}\n"
         f"Idioma: {target['idioma']}\n\n"
         f"Creemos que puede haber buen match por fechas, zona y preferencias. 😊"
     )
