@@ -2,9 +2,10 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import re
+import itertools
 from urllib.parse import quote
 
-DB_PATH = "match_v12_excel.db"
+DB_PATH = "match_v13_group.db"
 
 # =========================================================
 # CONFIG / NORMALIZATION FOR YOUR REAL EXCEL
@@ -47,9 +48,6 @@ REQUIRED_COLS = [
     "idioma", "zona", "budget", "inicio", "fin"
 ]
 
-VALID_GENERO = {"mujer", "hombre", "otro"}
-VALID_PREF_GENERO = {"mixto", "solo_mujeres", "solo_hombres"}
-
 GENERO_MAP = {
     "mujer": "mujer",
     "woman": "mujer",
@@ -79,6 +77,19 @@ PREF_GENERO_MAP = {
     "male only": "solo_hombres",
     "boys only": "solo_hombres",
 }
+
+DEFAULT_WEIGHTS = {
+    "dates": 0.40,
+    "zone": 0.30,
+    "pref_gender": 0.15,
+    "budget": 0.06,
+    "age": 0.03,
+    "language": 0.03,
+    "lifestyle": 0.01,
+    "routine": 0.01,
+    "remote": 0.01,
+}
+
 
 # =========================================================
 # DB
@@ -278,9 +289,7 @@ def normalize_phone(telefono) -> str:
     if not t:
         return ""
 
-    country_codes = [
-        "351", "353", "34", "52", "57", "54", "33", "39", "44", "49", "31", "41", "1"
-    ]
+    country_codes = ["351", "353", "34", "52", "57", "54", "33", "39", "44", "49", "31", "41", "1"]
 
     for cc in country_codes:
         if t.startswith(cc) and len(t) >= len(cc) + 7:
@@ -298,6 +307,10 @@ def normalize_phone(telefono) -> str:
 def detectar_pais(telefono: str) -> str:
     if not telefono:
         return "Unknown"
+    if telefono.startswith("+351"):
+        return "Portugal"
+    if telefono.startswith("+353"):
+        return "Ireland"
     if telefono.startswith("+34"):
         return "Spain"
     if telefono.startswith("+52"):
@@ -320,21 +333,15 @@ def detectar_pais(telefono: str) -> str:
         return "Netherlands"
     if telefono.startswith("+41"):
         return "Switzerland"
-    if telefono.startswith("+351"):
-        return "Portugal"
-    if telefono.startswith("+353"):
-        return "Ireland"
     return "Other"
 
 
 def normalize_genero(value: str) -> str:
-    v = str(value).strip().lower()
-    return GENERO_MAP.get(v, "otro")
+    return GENERO_MAP.get(str(value).strip().lower(), "otro")
 
 
 def normalize_pref_genero(value: str) -> str:
-    v = str(value).strip().lower()
-    return PREF_GENERO_MAP.get(v, "mixto")
+    return PREF_GENERO_MAP.get(str(value).strip().lower(), "mixto")
 
 
 def normalize_text(value) -> str:
@@ -358,14 +365,10 @@ def first_non_empty_sheet(uploaded_file) -> str:
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    original_cols = list(df.columns)
-    lowered_map = {c: str(c).strip().lower() for c in original_cols}
+    lowered_map = {c: str(c).strip().lower() for c in df.columns}
     df = df.rename(columns=lowered_map)
 
-    rename_map = {}
-    for c in df.columns:
-        if c in RAW_TO_STD_COLS:
-            rename_map[c] = RAW_TO_STD_COLS[c]
+    rename_map = {c: RAW_TO_STD_COLS[c] for c in df.columns if c in RAW_TO_STD_COLS}
     df = df.rename(columns=rename_map)
 
     for col in REQUIRED_COLS:
@@ -436,10 +439,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df["teletrabajo"] = df["teletrabajo"].apply(normalize_text)
     df["preferencia_rutina_hogar"] = df["preferencia_rutina_hogar"].apply(normalize_text)
 
-    df = df.dropna(subset=[
-        "nombre", "telefono", "edad", "idioma", "zona", "budget", "inicio", "fin"
-    ])
-
+    df = df.dropna(subset=["nombre", "telefono", "edad", "idioma", "zona", "budget", "inicio", "fin"])
     df = df[df["telefono"].str.len() >= 10]
     df = df[df["fin"] >= df["inicio"]]
 
@@ -455,10 +455,10 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# MATCHING HELPERS
+# MATCH HELPERS
 # =========================================================
 def zones_set(zona: str):
-    text = str(zona).replace("/", ",").replace("|", ",")
+    text = str(zona).replace("/", ",").replace("|", ",").replace(";", ",")
     parts = [z.strip().lower() for z in text.split(",")]
     return {p for p in parts if p}
 
@@ -471,77 +471,52 @@ def overlap_days(a_start, a_end, b_start, b_end) -> int:
     return (end - start).days + 1
 
 
+def period_length(start, end) -> int:
+    return max(1, (end - start).days + 1)
+
+
+def date_overlap_ratio(a_start, a_end, b_start, b_end) -> float:
+    days = overlap_days(a_start, a_end, b_start, b_end)
+    shorter = min(period_length(a_start, a_end), period_length(b_start, b_end))
+    return days / shorter if shorter > 0 else 0.0
+
+
 def zone_score(z1, z2) -> float:
-    return 1.0 if len(z1.intersection(z2)) > 0 else 0.0
+    inter = len(z1.intersection(z2))
+    if inter == 0:
+        return 0.0
+    union = len(z1.union(z2))
+    return inter / union if union > 0 else 0.0
 
 
-def budget_score(b1, b2, tolerance=0.20) -> float:
+def budget_score(b1, b2) -> float:
     if b1 <= 0 or b2 <= 0:
         return 0.0
     ratio = abs(b1 - b2) / max(b1, b2)
-    if ratio <= tolerance:
+    if ratio <= 0.10:
         return 1.0
-    return max(0.0, 1.0 - (ratio - tolerance) / 0.50)
-
-
-def date_score(days_overlap, min_days=30) -> float:
-    return min(1.0, days_overlap / float(min_days))
-
-
-def bath_score(b1, b2) -> float:
-    try:
-        d = abs(int(b1) - int(b2))
-        if d == 0:
-            return 1.0
-        if d == 1:
-            return 0.7
-        return 0.3
-    except Exception:
-        return 0.5
-
-
-def room_score(h1, h2) -> float:
-    try:
-        d = abs(int(h1) - int(h2))
-        if d == 0:
-            return 1.0
-        if d == 1:
-            return 0.7
-        return 0.4
-    except Exception:
-        return 0.5
+    if ratio <= 0.20:
+        return 0.90
+    if ratio <= 0.30:
+        return 0.75
+    if ratio <= 0.40:
+        return 0.55
+    if ratio <= 0.50:
+        return 0.35
+    return 0.10
 
 
 def age_score(e1, e2) -> float:
-    try:
-        diff = abs(int(e1) - int(e2))
-        return max(0.0, 1.0 - diff / 15.0)
-    except Exception:
-        return 0.5
-
-
-def exact_or_soft_text_score(v1, v2) -> float:
-    a = normalize_text(v1).lower()
-    b = normalize_text(v2).lower()
-
-    if not a or not b:
-        return 0.5
-    if a == b:
+    diff = abs(int(e1) - int(e2))
+    if diff <= 3:
         return 1.0
-    if a in b or b in a:
-        return 0.75
-    return 0.0
-
-
-def teletrabajo_score(v1, v2) -> float:
-    a = normalize_text(v1).lower()
-    b = normalize_text(v2).lower()
-
-    if not a or not b:
-        return 0.5
-    if a == b:
-        return 1.0
-    return 0.3
+    if diff <= 6:
+        return 0.85
+    if diff <= 10:
+        return 0.65
+    if diff <= 15:
+        return 0.45
+    return 0.20
 
 
 def idioma_score(i1, i2) -> float:
@@ -549,17 +524,40 @@ def idioma_score(i1, i2) -> float:
     b = normalize_text(i2).lower()
 
     if not a or not b:
-        return 0.5
+        return 0.50
     if a == b:
         return 1.0
 
-    sa = {x.strip() for x in re.split(r"[,/|]", a) if x.strip()}
-    sb = {x.strip() for x in re.split(r"[,/|]", b) if x.strip()}
+    sa = {x.strip() for x in re.split(r"[,/|;]", a) if x.strip()}
+    sb = {x.strip() for x in re.split(r"[,/|;]", b) if x.strip()}
 
     if sa.intersection(sb):
-        return 1.0
-
+        return 0.90
     return 0.0
+
+
+def exact_or_soft_text_score(v1, v2) -> float:
+    a = normalize_text(v1).lower()
+    b = normalize_text(v2).lower()
+
+    if not a or not b:
+        return 0.50
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.75
+    return 0.20
+
+
+def teletrabajo_score(v1, v2) -> float:
+    a = normalize_text(v1).lower()
+    b = normalize_text(v2).lower()
+
+    if not a or not b:
+        return 0.50
+    if a == b:
+        return 1.0
+    return 0.30
 
 
 def genero_compatible(pref_target: str, genero_other: str) -> bool:
@@ -575,15 +573,24 @@ def genero_compatible(pref_target: str, genero_other: str) -> bool:
     return True
 
 
-def match_genero_bidireccional(t: pd.Series, o: pd.Series) -> bool:
+def match_genero_bidireccional(a: pd.Series, b: pd.Series) -> bool:
     return (
-        genero_compatible(t["pref_genero"], o["genero"]) and
-        genero_compatible(o["pref_genero"], t["genero"])
+        genero_compatible(a.get("pref_genero", "mixto"), b.get("genero", "otro")) and
+        genero_compatible(b.get("pref_genero", "mixto"), a.get("genero", "otro"))
     )
 
 
+def preference_gender_score(a: pd.Series, b: pd.Series) -> float:
+    return 1.0 if match_genero_bidireccional(a, b) else 0.0
+
+
 def score_pair(target: pd.Series, other: pd.Series, min_overlap_days: int, require_zone: bool, weights: dict):
-    if not match_genero_bidireccional(target, other):
+    gender_ok = match_genero_bidireccional(target, other)
+    if not gender_ok:
+        return None
+
+    odays = overlap_days(target["inicio"], target["fin"], other["inicio"], other["fin"])
+    if odays < min_overlap_days:
         return None
 
     tz = zones_set(target["zona"])
@@ -593,12 +600,9 @@ def score_pair(target: pd.Series, other: pd.Series, min_overlap_days: int, requi
     if require_zone and zs == 0:
         return None
 
-    odays = overlap_days(target["inicio"], target["fin"], other["inicio"], other["fin"])
-    ds = date_score(odays, min_days=min_overlap_days)
+    ds = date_overlap_ratio(target["inicio"], target["fin"], other["inicio"], other["fin"])
     bs = budget_score(float(target["budget"]), float(other["budget"]))
     ages = age_score(target["edad"], other["edad"])
-    baths = bath_score(target.get("banos_min", 1), other.get("banos_min", 1))
-    rooms = room_score(target.get("habitaciones", 0), other.get("habitaciones", 0))
     langs = idioma_score(target.get("idioma", ""), other.get("idioma", ""))
     life = exact_or_soft_text_score(target.get("estilo_vida", ""), other.get("estilo_vida", ""))
     routine = exact_or_soft_text_score(
@@ -606,14 +610,14 @@ def score_pair(target: pd.Series, other: pd.Series, min_overlap_days: int, requi
         other.get("preferencia_rutina_hogar", "")
     )
     remote = teletrabajo_score(target.get("teletrabajo", ""), other.get("teletrabajo", ""))
+    pgs = preference_gender_score(target, other)
 
     total = (
-        weights["zone"] * zs +
-        weights["budget"] * bs +
         weights["dates"] * ds +
+        weights["zone"] * zs +
+        weights["pref_gender"] * pgs +
+        weights["budget"] * bs +
         weights["age"] * ages +
-        weights["bath"] * baths +
-        weights["rooms"] * rooms +
         weights["language"] * langs +
         weights["lifestyle"] * life +
         weights["routine"] * routine +
@@ -622,12 +626,11 @@ def score_pair(target: pd.Series, other: pd.Series, min_overlap_days: int, requi
 
     return {
         "score_total": float(total),
-        "score_zone": float(zs),
-        "score_budget": float(bs),
         "score_dates": float(ds),
+        "score_zone": float(zs),
+        "score_pref_gender": float(pgs),
+        "score_budget": float(bs),
         "score_age": float(ages),
-        "score_bath": float(baths),
-        "score_rooms": float(rooms),
         "score_language": float(langs),
         "score_lifestyle": float(life),
         "score_routine": float(routine),
@@ -650,18 +653,7 @@ def compute_matches(
         return pd.DataFrame()
 
     if weights is None:
-        weights = {
-            "zone": 0.20,
-            "budget": 0.15,
-            "dates": 0.15,
-            "age": 0.10,
-            "bath": 0.05,
-            "rooms": 0.05,
-            "language": 0.10,
-            "lifestyle": 0.08,
-            "routine": 0.07,
-            "remote": 0.05,
-        }
+        weights = DEFAULT_WEIGHTS.copy()
 
     target = df[df["id"] == target_id].iloc[0]
     rows = []
@@ -670,8 +662,10 @@ def compute_matches(
         if int(other["id"]) == int(target_id):
             continue
 
-        if country_filter != "All" and other.get("pais_origen", "") != country_filter:
-            continue
+        if country_filter != "All":
+            other_country = normalize_text(other.get("pais_origen", "")) or normalize_text(other.get("pais", ""))
+            if other_country != country_filter:
+                continue
 
         if language_filter != "All":
             other_lang = normalize_text(other.get("idioma", ""))
@@ -695,27 +689,179 @@ def compute_matches(
             "match_budget": other.get("budget", 0),
             "match_start": other.get("inicio"),
             "match_end": other.get("fin"),
-            "match_banos_min": int(other.get("banos_min", 1)) if pd.notna(other.get("banos_min", 1)) else 1,
-            "match_habitaciones": int(other.get("habitaciones", 0)) if pd.notna(other.get("habitaciones", 0)) else 0,
             "match_estilo_vida": other.get("estilo_vida", ""),
             "match_teletrabajo": other.get("teletrabajo", ""),
             "match_rutina": other.get("preferencia_rutina_hogar", ""),
-            "match_busqueda_vivienda": other.get("busqueda_vivienda", ""),
             "match_perfil": other.get("perfil", ""),
-            **{k: round(v, 3) if isinstance(v, float) else v for k, v in scored.items()},
-            "notes": other.get("notas", "")
+            "notes": other.get("notas", ""),
+            **{k: round(v, 3) if isinstance(v, float) else v for k, v in scored.items()}
         })
 
     out = pd.DataFrame(rows)
     if out.empty:
         return out
 
-    out = out.sort_values("score_total", ascending=False).head(int(top_n))
+    out = out.sort_values(
+        by=["score_total", "score_dates", "score_zone", "score_pref_gender", "overlap_days"],
+        ascending=[False, False, False, False, False]
+    ).head(int(top_n))
     return out
 
 
 # =========================================================
-# WHATSAPP HELPERS
+# GROUP MATCHING
+# =========================================================
+def pair_score_lookup(df: pd.DataFrame, ids: list[int], min_overlap_days: int, require_zone: bool, weights: dict):
+    lookup = {}
+    for i, j in itertools.combinations(ids, 2):
+        a = df[df["id"] == i].iloc[0]
+        b = df[df["id"] == j].iloc[0]
+        s = score_pair(a, b, min_overlap_days, require_zone, weights)
+        lookup[(i, j)] = s
+        lookup[(j, i)] = s
+    return lookup
+
+
+def group_common_zone(group_df: pd.DataFrame) -> str:
+    zone_sets = [zones_set(z) for z in group_df["zona"].tolist()]
+    if not zone_sets:
+        return ""
+    inter = zone_sets[0].copy()
+    for z in zone_sets[1:]:
+        inter = inter.intersection(z)
+    if inter:
+        return ", ".join(sorted(inter))
+    union = set()
+    for z in zone_sets:
+        union.update(z)
+    return ", ".join(sorted(union))
+
+
+def group_common_dates(group_df: pd.DataFrame):
+    latest_start = max(group_df["inicio"].tolist())
+    earliest_end = min(group_df["fin"].tolist())
+    overlap = 0
+    if earliest_end >= latest_start:
+        overlap = (earliest_end - latest_start).days + 1
+    return latest_start, earliest_end, overlap
+
+
+def group_gender_compatible(group_df: pd.DataFrame) -> bool:
+    members = list(group_df.to_dict(orient="records"))
+    for a, b in itertools.combinations(members, 2):
+        sa = pd.Series(a)
+        sb = pd.Series(b)
+        if not match_genero_bidireccional(sa, sb):
+            return False
+    return True
+
+
+def group_avg_budget(group_df: pd.DataFrame) -> float:
+    return float(group_df["budget"].mean())
+
+
+def compute_group_matches(
+    df: pd.DataFrame,
+    target_id: int,
+    group_size: int = 3,
+    top_n: int = 10,
+    min_overlap_days: int = 30,
+    require_zone: bool = True,
+    weights=None
+) -> pd.DataFrame:
+    if df.empty or group_size < 2:
+        return pd.DataFrame()
+
+    if weights is None:
+        weights = DEFAULT_WEIGHTS.copy()
+
+    target_df = df[df["id"] == int(target_id)]
+    if target_df.empty:
+        return pd.DataFrame()
+
+    target = target_df.iloc[0]
+    other_ids = [int(x) for x in df[df["id"] != int(target_id)]["id"].tolist()]
+    if len(other_ids) < group_size - 1:
+        return pd.DataFrame()
+
+    lookup = pair_score_lookup(df, [int(target_id)] + other_ids, min_overlap_days, require_zone, weights)
+    rows = []
+
+    for combo in itertools.combinations(other_ids, group_size - 1):
+        member_ids = [int(target_id)] + list(combo)
+        group_df = df[df["id"].isin(member_ids)].copy()
+
+        if len(group_df) != group_size:
+            continue
+
+        if not group_gender_compatible(group_df):
+            continue
+
+        latest_start, earliest_end, overlap = group_common_dates(group_df)
+        if overlap < min_overlap_days:
+            continue
+
+        common_zone = group_common_zone(group_df)
+        if require_zone and not common_zone:
+            continue
+
+        pair_scores = []
+        valid = True
+
+        for a, b in itertools.combinations(member_ids, 2):
+            s = lookup.get((a, b))
+            if s is None:
+                valid = False
+                break
+            pair_scores.append(s)
+
+        if not valid or not pair_scores:
+            continue
+
+        avg_total = sum(x["score_total"] for x in pair_scores) / len(pair_scores)
+        avg_dates = sum(x["score_dates"] for x in pair_scores) / len(pair_scores)
+        avg_zone = sum(x["score_zone"] for x in pair_scores) / len(pair_scores)
+        avg_pref_gender = sum(x["score_pref_gender"] for x in pair_scores) / len(pair_scores)
+        avg_budget = sum(x["score_budget"] for x in pair_scores) / len(pair_scores)
+
+        member_lines = []
+        for _, row in group_df.sort_values("nombre").iterrows():
+            member_lines.append(
+                f"{row['nombre']} | {row['edad']} años | {row['telefono']} | {row['zona']}"
+            )
+
+        rows.append({
+            "group_size": group_size,
+            "member_ids": member_ids,
+            "member_names": " | ".join(group_df.sort_values("nombre")["nombre"].tolist()),
+            "member_contacts": " | ".join(group_df.sort_values("nombre")["telefono"].tolist()),
+            "group_common_zone": common_zone,
+            "group_start": latest_start,
+            "group_end": earliest_end,
+            "group_overlap_days": overlap,
+            "group_avg_budget": round(group_avg_budget(group_df), 2),
+            "score_total": round(avg_total, 4),
+            "score_dates": round(avg_dates, 4),
+            "score_zone": round(avg_zone, 4),
+            "score_pref_gender": round(avg_pref_gender, 4),
+            "score_budget": round(avg_budget, 4),
+            "members_detail": "\n".join(member_lines),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out = out.sort_values(
+        by=["score_total", "score_dates", "score_zone", "score_pref_gender", "group_overlap_days"],
+        ascending=[False, False, False, False, False]
+    ).head(int(top_n))
+
+    return out
+
+
+# =========================================================
+# WHATSAPP / COPY TEXT
 # =========================================================
 def wa_digits(phone: str) -> str:
     if not phone:
@@ -723,34 +869,69 @@ def wa_digits(phone: str) -> str:
     return re.sub(r"[^\d]", "", str(phone))
 
 
-def generate_whatsapp_intro(target: pd.Series, match_row: pd.Series) -> str:
-    target_country = target.get("pais_origen", "") or target.get("pais", "")
-    return (
-        f"Hi {match_row['match_name']}! 👋\n\n"
-        f"I'm connecting you with someone who could be a great roommate match.\n\n"
-        f"✅ Potential roommate: {target['nombre']} ({target['edad']}), {target_country} — {target['telefono']}\n"
-        f"• Preferred areas: {target['zona']}\n"
-        f"• Budget: €{int(target['budget'])}\n"
-        f"• Dates: {target['inicio']} to {target['fin']}\n"
-        f"• Language: {target['idioma']}\n"
-        f"• Lifestyle: {target.get('estilo_vida', '')}\n"
-        f"• Home routine: {target.get('preferencia_rutina_hogar', '')}\n\n"
-        f"About you (from our database):\n"
-        f"• Areas: {match_row['match_zone']}\n"
-        f"• Budget: €{int(match_row['match_budget'])}\n"
-        f"• Dates: {match_row['match_start']} to {match_row['match_end']}\n"
-        f"• Language: {match_row['match_language']}\n"
-        f"• Lifestyle: {match_row.get('match_estilo_vida', '')}\n"
-        f"• Home routine: {match_row.get('match_rutina', '')}\n\n"
-        f"If you're both happy, you can message each other directly and set up a quick call 😊"
-    )
-
-
 def whatsapp_web_link(phone: str, message: str) -> str:
     digits = wa_digits(phone)
     if not digits:
         return ""
     return f"https://wa.me/{digits}?text={quote(message)}"
+
+
+def build_copy_text_for_1to1(target: pd.Series, matches: pd.DataFrame) -> str:
+    if matches.empty:
+        return "No encontré matches con los filtros actuales."
+
+    lines = []
+    lines.append(f"Estos son tus matches para {target['nombre']}:")
+    lines.append("")
+
+    for idx, (_, r) in enumerate(matches.iterrows(), start=1):
+        lines.append(f"{idx}. {r['match_name']}")
+        lines.append(f"Contacto: {r['match_phone']}")
+        lines.append(f"Edad: {r['match_age']}")
+        lines.append(f"Zona match: {r['match_zone']}")
+        lines.append(f"Fechas: {r['match_start']} a {r['match_end']}")
+        lines.append(f"Overlap: {r['overlap_days']} días")
+        lines.append(f"Score total: {round(float(r['score_total']) * 100, 1)}%")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def build_copy_text_for_groups(target: pd.Series, groups_df: pd.DataFrame) -> str:
+    if groups_df.empty:
+        return "No encontré grupos compatibles con los filtros actuales."
+
+    lines = []
+    lines.append(f"Estos son tus matches en grupo para {target['nombre']}:")
+    lines.append("")
+
+    for idx, (_, g) in enumerate(groups_df.iterrows(), start=1):
+        lines.append(f"Grupo {idx} ({g['group_size']} personas)")
+        lines.append(f"Zona match: {g['group_common_zone']}")
+        lines.append(f"Fechas en común: {g['group_start']} a {g['group_end']}")
+        lines.append(f"Overlap grupo: {g['group_overlap_days']} días")
+        lines.append(f"Score total grupo: {round(float(g['score_total']) * 100, 1)}%")
+        lines.append("Integrantes:")
+        for member_line in str(g["members_detail"]).split("\n"):
+            lines.append(f"- {member_line}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def generate_whatsapp_intro_for_pair(target: pd.Series, match_row: pd.Series) -> str:
+    return (
+        f"Hola {match_row['match_name']} 👋\n\n"
+        f"Te comparto un posible roommate match:\n\n"
+        f"Nombre: {target['nombre']}\n"
+        f"Contacto: {target['telefono']}\n"
+        f"Edad: {target['edad']}\n"
+        f"Zona: {target['zona']}\n"
+        f"Fechas: {target['inicio']} a {target['fin']}\n"
+        f"Budget: €{int(target['budget'])}\n"
+        f"Idioma: {target['idioma']}\n\n"
+        f"Creemos que puede haber buen match por fechas, zona y preferencias. 😊"
+    )
 
 
 # =========================================================
@@ -770,7 +951,7 @@ def dashboard(df: pd.DataFrame):
         st.metric("Avg age", round(df["edad"].mean(), 1) if "edad" in df.columns and len(df) else "—")
 
     if "zona" in df.columns and len(df):
-        z = df["zona"].astype(str).str.replace(",", "|")
+        z = df["zona"].astype(str).str.replace(",", "|").str.replace("/", "|").str.replace(";", "|")
         z = z.str.split("|").explode().str.strip()
         z = z[z != ""]
         top_z = z.value_counts().head(10)
@@ -792,26 +973,13 @@ def dashboard(df: pd.DataFrame):
         counts.index = counts.index.astype(str)
         st.bar_chart(counts)
 
-    if "estilo_vida" in df.columns and len(df):
-        clean_life = df["estilo_vida"].fillna("").astype(str).str.strip()
-        clean_life = clean_life[clean_life != ""]
-        if len(clean_life):
-            st.markdown("**Lifestyle**")
-            st.bar_chart(clean_life.value_counts())
-
-    if "preferencia_rutina_hogar" in df.columns and len(df):
-        clean_rutina = df["preferencia_rutina_hogar"].fillna("").astype(str).str.strip()
-        clean_rutina = clean_rutina[clean_rutina != ""]
-        if len(clean_rutina):
-            st.markdown("**Home routine preference**")
-            st.bar_chart(clean_rutina.value_counts())
-
 
 # =========================================================
 # UI
 # =========================================================
-st.set_page_config(page_title="Programa Match", layout="wide")
-st.title("🏡 Roommate Matching System — Excel-based Matching")
+st.set_page_config(page_title="Programa Match HAUS", layout="wide")
+st.title("🏡 HAUS Mate — Matching 1-to-1 + Group Matching")
+st.caption("Prioridad fuerte: fechas + zona + preferred gender")
 
 init_db()
 
@@ -839,7 +1007,12 @@ with st.sidebar:
 
 df = load_clients()
 
-tab1, tab2, tab3 = st.tabs(["Dashboard", "Match (1-to-1)", "Database Preview"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Dashboard",
+    "Match 1-to-1",
+    "Group Matches (3-5)",
+    "Database Preview"
+])
 
 with tab1:
     if df.empty:
@@ -848,29 +1021,30 @@ with tab1:
         dashboard(df)
 
 with tab2:
-    st.subheader("💞 Matchmaking (1-to-1)")
+    st.subheader("💞 Matchmaking 1-to-1")
+
     if df.empty:
         st.info("Upload clients to start matching.")
     else:
-        colA, colB, colC, colD = st.columns([2, 1, 1, 1])
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 
-        with colA:
+        with c1:
             target_id = st.selectbox(
                 "Select client",
                 options=df["id"].tolist(),
                 format_func=lambda x: (
                     f"{int(x)} — {df[df['id'] == x].iloc[0]['nombre']} "
-                    f"({df[df['id'] == x].iloc[0].get('pais_origen','')})"
+                    f"({df[df['id'] == x].iloc[0].get('pais_origen', '')})"
                 )
             )
 
-        with colB:
+        with c2:
             top_n = st.number_input("Top N", min_value=3, max_value=100, value=15)
 
-        with colC:
+        with c3:
             min_overlap_days = st.number_input("Min overlap (days)", min_value=1, max_value=365, value=30)
 
-        with colD:
+        with c4:
             require_zone = st.checkbox("Require same zone", value=True)
 
         countries = ["All"] + sorted([
@@ -888,43 +1062,36 @@ with tab2:
         with f2:
             language_filter = st.selectbox("Filter by language", options=languages)
 
-        st.markdown("### Scoring weights (advanced)")
-        wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
-        with wcol1:
-            w_zone = st.slider("Zone", 0.0, 0.5, 0.20, 0.05)
-            w_budget = st.slider("Budget", 0.0, 0.5, 0.15, 0.05)
-        with wcol2:
-            w_dates = st.slider("Dates", 0.0, 0.5, 0.15, 0.05)
-            w_age = st.slider("Age", 0.0, 0.5, 0.10, 0.05)
-        with wcol3:
-            w_bath = st.slider("Bathrooms", 0.0, 0.5, 0.05, 0.05)
-            w_rooms = st.slider("Rooms", 0.0, 0.5, 0.05, 0.05)
-        with wcol4:
-            w_language = st.slider("Language", 0.0, 0.5, 0.10, 0.05)
-            w_lifestyle = st.slider("Lifestyle", 0.0, 0.5, 0.08, 0.05)
-        with wcol5:
-            w_routine = st.slider("Home routine", 0.0, 0.5, 0.07, 0.05)
-            w_remote = st.slider("Remote work", 0.0, 0.5, 0.05, 0.05)
+        st.markdown("### Priority weights")
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            w_dates = st.slider("Dates", 0.0, 1.0, 0.40, 0.01)
+            w_zone = st.slider("Zone", 0.0, 1.0, 0.30, 0.01)
+            w_pref_gender = st.slider("Preferred gender", 0.0, 1.0, 0.15, 0.01)
+        with w2:
+            w_budget = st.slider("Budget", 0.0, 1.0, 0.06, 0.01)
+            w_age = st.slider("Age", 0.0, 1.0, 0.03, 0.01)
+            w_language = st.slider("Language", 0.0, 1.0, 0.03, 0.01)
+        with w3:
+            w_lifestyle = st.slider("Lifestyle", 0.0, 1.0, 0.01, 0.01)
+            w_routine = st.slider("Home routine", 0.0, 1.0, 0.01, 0.01)
+            w_remote = st.slider("Remote work", 0.0, 1.0, 0.01, 0.01)
 
         total_w = (
-            w_zone + w_budget + w_dates + w_age + w_bath +
-            w_rooms + w_language + w_lifestyle + w_routine + w_remote
+            w_dates + w_zone + w_pref_gender + w_budget + w_age +
+            w_language + w_lifestyle + w_routine + w_remote
         )
 
         if total_w == 0:
             st.warning("Set at least one weight > 0.")
-            weights = {
-                "zone": 0, "budget": 0, "dates": 0, "age": 0, "bath": 0,
-                "rooms": 0, "language": 0, "lifestyle": 0, "routine": 0, "remote": 0
-            }
+            weights = {k: 0 for k in DEFAULT_WEIGHTS.keys()}
         else:
             weights = {
-                "zone": w_zone / total_w,
-                "budget": w_budget / total_w,
                 "dates": w_dates / total_w,
+                "zone": w_zone / total_w,
+                "pref_gender": w_pref_gender / total_w,
+                "budget": w_budget / total_w,
                 "age": w_age / total_w,
-                "bath": w_bath / total_w,
-                "rooms": w_rooms / total_w,
                 "language": w_language / total_w,
                 "lifestyle": w_lifestyle / total_w,
                 "routine": w_routine / total_w,
@@ -945,13 +1112,18 @@ with tab2:
         if matches.empty:
             st.info("No matches found with the current filters/rules.")
         else:
-            st.markdown("### ✅ Matches (advanced score breakdown)")
+            st.markdown("### ✅ Matches")
             st.dataframe(matches, use_container_width=True)
 
             target = df[df["id"] == int(target_id)].iloc[0]
+            copy_text = build_copy_text_for_1to1(target, matches)
+
+            st.markdown("### 📋 Mensaje listo para copiar y pegar")
+            st.text_area("Copy text", value=copy_text, height=350)
+
             wa_rows = []
             for _, r in matches.iterrows():
-                msg = generate_whatsapp_intro(target, r)
+                msg = generate_whatsapp_intro_for_pair(target, r)
                 link = whatsapp_web_link(r.get("match_phone", ""), msg)
                 wa_rows.append({
                     "match_id": r["match_id"],
@@ -961,10 +1133,62 @@ with tab2:
                 })
             wa_df = pd.DataFrame(wa_rows)
 
-            st.markdown("### 📲 WhatsApp Web links")
+            st.markdown("### 📲 WhatsApp links")
             st.dataframe(wa_df, use_container_width=True)
 
 with tab3:
+    st.subheader("👥 Group Matches (3-5 personas)")
+
+    if df.empty:
+        st.info("Upload clients to start matching.")
+    else:
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+
+        with c1:
+            target_id_group = st.selectbox(
+                "Select client for group match",
+                options=df["id"].tolist(),
+                key="group_target_id",
+                format_func=lambda x: (
+                    f"{int(x)} — {df[df['id'] == x].iloc[0]['nombre']} "
+                    f"({df[df['id'] == x].iloc[0].get('pais_origen', '')})"
+                )
+            )
+
+        with c2:
+            group_size = st.selectbox("Group size", options=[3, 4, 5], index=0)
+
+        with c3:
+            top_n_groups = st.number_input("Top groups", min_value=1, max_value=50, value=10)
+
+        with c4:
+            min_overlap_days_group = st.number_input("Min overlap days", min_value=1, max_value=365, value=30, key="group_days")
+
+        require_zone_group = st.checkbox("Require same/common zone in group", value=True, key="group_zone")
+
+        group_matches = compute_group_matches(
+            df=df,
+            target_id=int(target_id_group),
+            group_size=int(group_size),
+            top_n=int(top_n_groups),
+            min_overlap_days=int(min_overlap_days_group),
+            require_zone=bool(require_zone_group),
+            weights=DEFAULT_WEIGHTS.copy()
+        )
+
+        if group_matches.empty:
+            st.info("No compatible groups found.")
+        else:
+            st.markdown("### ✅ Group matches")
+            st.dataframe(group_matches, use_container_width=True)
+
+            target_group = df[df["id"] == int(target_id_group)].iloc[0]
+            group_copy_text = build_copy_text_for_groups(target_group, group_matches)
+
+            st.markdown("### 📋 Mensaje de grupos listo para copiar y pegar")
+            st.text_area("Copy group text", value=group_copy_text, height=420)
+
+with tab4:
     st.subheader("🗂 Database preview")
     if df.empty:
         st.info("No data loaded yet.")
